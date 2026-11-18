@@ -416,7 +416,8 @@ docker = []                       # registry hosts
 
 [[forward.command]]               # optional custom resolver for matching scopes
 match = { kind = "git", host = "gitlab.acme.dev" }
-command = ["glab", "auth", "token"]   # no shell; stdout = secret, or JSON {secret, username?, expires_at?}
+command = ["sh", "-c", "printf '{\"secret\":\"%s\",\"username\":\"oauth2\"}' \"$GITLAB_TOKEN\""]
+# run without a shell unless you call one; stdout = secret, or JSON {secret, username?, expires_at?}
 # timeout = 60
 
 [[credentials]]
@@ -506,9 +507,10 @@ permissions = { contents = "read" }
 allow_tokens = ["*"]
 ```
 
-**GitLab.** Either forward from your machine (OAuth through `glab` or Git
-Credential Manager) with `[forward]` and, for example,
-`[[forward.command]]` running `glab auth token`; or put a deploy token on
+**GitLab.** Either forward from your machine with `[forward]`: through a Git
+credential helper (Git Credential Manager gives short-lived OAuth tokens), or
+a `[[forward.command]]` that prints your token (`glab` has no command that
+prints it, so read `GITLAB_TOKEN` or a password manager); or put a deploy token on
 the agent with a `file` provider:
 
 ```toml

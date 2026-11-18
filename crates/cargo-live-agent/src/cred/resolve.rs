@@ -53,6 +53,10 @@ pub struct CredSession {
     audit_log: PathBuf,
     /// Successful resolutions with their source label.
     cache: Mutex<HashMap<Scope, (String, Credential)>>,
+    /// Index URL → registry name for the current job, so a request that
+    /// only carries an index (e.g. a `[source]` replacement of crates.io)
+    /// matches rules and `[forward]` entries written with the name.
+    registry_indexes: Mutex<HashMap<String, String>>,
 }
 
 struct Plan {
@@ -84,6 +88,7 @@ impl CredSession {
             creds,
             audit_log,
             cache: Mutex::new(HashMap::new()),
+            registry_indexes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -95,6 +100,24 @@ impl CredSession {
         *self.policy.lock().unwrap() = policy;
         // Decisions depend on the policy.
         self.cache.lock().unwrap().clear();
+    }
+
+    pub fn set_registry_indexes(&self, indexes: HashMap<String, String>) {
+        *self.registry_indexes.lock().unwrap() = indexes;
+    }
+
+    /// Fills in the registry name of a cargo scope that only has an index.
+    fn named(&self, scope: &Scope) -> Scope {
+        match scope {
+            Scope::Cargo {
+                name: None,
+                index: Some(index),
+            } => Scope::Cargo {
+                name: self.registry_indexes.lock().unwrap().get(index).cloned(),
+                index: Some(index.clone()),
+            },
+            other => other.clone(),
+        }
     }
 
     pub fn registries_config(&self) -> Vec<String> {
@@ -271,6 +294,7 @@ impl CredSession {
         phase: Phase,
         client: &mpsc::Sender<ToClient>,
     ) -> Option<Credential> {
+        let scope = &self.named(scope);
         if let Err(e) = scope.validate() {
             return self.fail(client, scope, phase, vec![e]).await;
         }
@@ -426,6 +450,23 @@ mod tests {
     use super::*;
     use crate::cred::config::{ProviderKind, SecretRef, TokenPolicy};
     use cargo_live_proto::cred::{CredMatch, ForwardAllowlist, Kind, Rule, RuleOrigin};
+
+    #[test]
+    fn index_only_cargo_scopes_get_the_registry_name() {
+        let session = CredSession::new(
+            "t".into(),
+            Arc::new(AgentCreds::default()),
+            PathBuf::from("/nonexistent/audit.log"),
+        );
+        let index = "sparse+https://crates.example/api/v1/cratesio/";
+        session.set_registry_indexes(HashMap::from([(index.to_owned(), "mirror".to_owned())]));
+        assert_eq!(
+            session.named(&Scope::cargo(None, Some(index))),
+            Scope::cargo(Some("mirror"), Some(index))
+        );
+        let other = Scope::cargo(None, Some("sparse+https://other/"));
+        assert_eq!(session.named(&other), other);
+    }
 
     fn provider(
         name: &str,

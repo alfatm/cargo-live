@@ -19,6 +19,7 @@ use cargo_live_proto::{
 
 use crate::cred::broker::{BROKER_ENV, NONCE_ENV};
 use crate::cred::{Broker, CredSession, ToClient};
+use crate::log;
 use crate::runner::{RunnerOutput, OUT_ENV};
 use crate::server::Shared;
 use crate::session::Workspace;
@@ -209,6 +210,20 @@ where
     let host_triple = host_triple(&shared.settings.cargo).await;
     let cwd = working_dir(ws, request)?;
     let registries = creds.registries_config();
+    let known = crate::cred::broker::known_registries(&registries, &cwd);
+    creds.set_registry_indexes(
+        known
+            .iter()
+            .filter_map(|(name, index)| Some((index.clone()?, name.clone())))
+            .collect(),
+    );
+    let registry_names: Vec<String> = known.into_iter().map(|(name, _)| name).collect();
+    if !registry_names.is_empty() {
+        log!(
+            "registries using the credential broker: {}",
+            registry_names.join(", ")
+        );
+    }
     let _ = fs::remove_file(&ws.runner_out);
 
     let _permit = match shared.builds.try_acquire() {
@@ -241,7 +256,12 @@ where
         client_tx,
         &shared.agent_exe,
     )?;
-    let extra = broker.configure(&mut fetch, &shared.agent_exe, &creds.git_hosts())?;
+    let extra = broker.configure(
+        &mut fetch,
+        &shared.agent_exe,
+        &creds.git_hosts(),
+        &registry_names,
+    )?;
     fetch.args(extra);
     let code = run_step(shared, fetch, client_rx, rd, wr).await;
     drop(broker);
@@ -270,7 +290,12 @@ where
             client_tx,
             &shared.agent_exe,
         )?;
-        let extra = broker.configure(&mut cmd, &shared.agent_exe, &creds.git_hosts())?;
+        let extra = broker.configure(
+            &mut cmd,
+            &shared.agent_exe,
+            &creds.git_hosts(),
+            &registry_names,
+        )?;
         cmd.args(extra);
         Some(broker)
     } else {

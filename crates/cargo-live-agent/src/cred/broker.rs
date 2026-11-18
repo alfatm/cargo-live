@@ -128,6 +128,7 @@ impl Broker {
         cmd: &mut Command,
         agent_exe: &Path,
         git_hosts: &[String],
+        registry_names: &[String],
     ) -> Result<Vec<String>> {
         let exe = agent_exe
             .to_str()
@@ -145,7 +146,7 @@ impl Broker {
             cmd.env(k, v);
         }
         let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
-        Ok(vec![
+        let args = vec![
             "--config".into(),
             format!(
                 "credential-alias.cargo-live=[{}, {}, {}]",
@@ -155,7 +156,19 @@ impl Broker {
             ),
             "--config".into(),
             "registry.global-credential-providers=[\"cargo-live\"]".into(),
-        ])
+        ];
+        // A registry's own `credential-provider` (e.g. `["cargo:token"]` in
+        // the image's Cargo home) takes precedence over the global list, so
+        // every known registry is pointed at the broker explicitly. This must
+        // be an environment variable holding a string: Cargo concatenates
+        // arrays from different config sources (a `--config` array would
+        // become `["cargo:token", "cargo-live"]`) and refuses to merge a
+        // string `--config` value with an array, while an environment
+        // variable replaces the value.
+        for name in registry_names {
+            cmd.env(registry_provider_env(name), "cargo-live");
+        }
+        Ok(args)
     }
 }
 
@@ -166,6 +179,95 @@ impl Drop for Broker {
         self.task.abort();
         let _ = fs::remove_file(&self.socket);
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `CARGO_REGISTRIES_<NAME>_CREDENTIAL_PROVIDER` for a registry name.
+fn registry_provider_env(name: &str) -> String {
+    format!(
+        "CARGO_REGISTRIES_{}_CREDENTIAL_PROVIDER",
+        name.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+/// The Cargo registries remote Cargo will see: those in the
+/// client's forwarded registry config, in the agent's Cargo home (with
+/// `include`s) and in `.cargo/config{,.toml}` of `cwd` and its ancestors.
+/// Names that are not plain `[A-Za-z0-9_-]` keys are skipped.
+/// Each entry is `(name, index URL if defined)`; the first definition of a
+/// name wins, as forwarded entries and nearer configs take precedence.
+pub fn known_registries(forwarded: &[String], cwd: &Path) -> Vec<(String, Option<String>)> {
+    let mut found: Vec<(String, Option<String>)> = Vec::new();
+    let mut add = |table: &toml::Table| {
+        if let Some(registries) = table.get("registries").and_then(toml::Value::as_table) {
+            for (name, def) in registries {
+                let valid = !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+                let index = def
+                    .get("index")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned);
+                match found.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, existing)) if existing.is_none() => *existing = index,
+                    Some(_) => {}
+                    None if valid => found.push((name.clone(), index)),
+                    None => {}
+                }
+            }
+        }
+    };
+    for entry in forwarded {
+        if let Ok(table) = toml::from_str::<toml::Table>(entry) {
+            add(&table);
+        }
+    }
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")));
+    let mut files = Vec::new();
+    for dir in cwd.ancestors() {
+        files.push(dir.join(".cargo/config.toml"));
+        files.push(dir.join(".cargo/config"));
+    }
+    if let Some(home) = cargo_home {
+        files.push(home.join("config.toml"));
+        files.push(home.join("config"));
+    }
+    for file in files {
+        read_cargo_config(&file, 0, &mut add);
+    }
+    found
+}
+
+/// Parses one Cargo config file and the files it `include`s.
+fn read_cargo_config(path: &Path, depth: usize, add: &mut impl FnMut(&toml::Table)) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+        return;
+    };
+    add(&table);
+    let includes = match table.get("include") {
+        Some(toml::Value::String(s)) => vec![s.clone()],
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                toml::Value::String(s) => Some(s.clone()),
+                toml::Value::Table(t) => t.get("path").and_then(|p| p.as_str()).map(str::to_owned),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    for include in includes {
+        read_cargo_config(&dir.join(include), depth + 1, add);
     }
 }
 
@@ -320,6 +422,36 @@ mod tests {
     use super::*;
     use crate::cred::config::{AgentCreds, Provider, ProviderKind, SecretRef};
     use cargo_live_proto::cred::{CredMatch, Kind};
+
+    #[test]
+    fn registry_names_cover_forwarded_project_and_included_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("ws/source/app");
+        fs::create_dir_all(project.join(".cargo")).unwrap();
+        fs::write(
+            project.join(".cargo/config.toml"),
+            "include = [\"more.toml\"]\n[registries.proj]\nindex = \"sparse+https://p/\"\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join(".cargo/more.toml"),
+            "[registries.included]\nindex = \"sparse+https://i/\"\n\
+             [registries.\"bad name\"]\nindex = \"sparse+https://b/\"\n",
+        )
+        .unwrap();
+        let forwarded = vec!["registries.fwd.index = \"sparse+https://f/\"".to_owned()];
+        let names: Vec<String> = known_registries(&forwarded, &project)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        for name in ["fwd", "proj", "included"] {
+            assert!(
+                names.contains(&name.to_owned()),
+                "{name} missing from {names:?}"
+            );
+        }
+        assert!(!names.iter().any(|n| n.contains(' ')));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn broker_serves_with_nonce_and_cleans_up() {
