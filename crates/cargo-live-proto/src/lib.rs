@@ -9,6 +9,7 @@
 //! `AgentMsg::Error` must keep their variant index and fields forever so that
 //! mismatched versions can still report the mismatch.
 
+pub mod cred;
 mod exclude;
 mod frame;
 mod path;
@@ -16,12 +17,14 @@ mod path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use cred::{CredEvent, Credential, CredentialPolicy, ExplainStep, Phase, Scope};
+
 pub use exclude::{ExcludeError, ExcludeSet};
-pub use frame::{decode, encode, read_frame, write_frame, FrameError, MAX_FRAME};
+pub use frame::{decode, encode, read_frame, write_frame, FrameError, FrameReader, MAX_FRAME};
 pub use path::{is_token_name, is_workspace_id, validate_relative_path, PathError};
 
 /// Bumped on every incompatible protocol change.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// The SSH exec/subsystem name the agent accepts.
 pub const CHANNEL_NAME: &str = "cargo-live";
 /// The SSH user name; the password is the API token.
@@ -58,6 +61,18 @@ pub enum ClientMsg {
     Fetch {
         executable: String,
         known_blake3: Option<String>,
+    },
+    /// Credential rules, the forwarding allowlist and registry definitions.
+    /// Sent after `Opened` (or before `Explain`); replaces earlier policy.
+    CredentialPolicy(CredentialPolicy),
+    /// Answer to `AgentMsg::CredentialRequest`. The error is a short reason.
+    CredentialResponse {
+        id: u64,
+        result: Result<Credential, String>,
+    },
+    /// Dry run of the credential resolution for `scope`.
+    Explain {
+        scope: Scope,
     },
 }
 
@@ -103,6 +118,19 @@ pub enum AgentMsg {
     },
     BinaryChunk(Vec<u8>),
     BinaryEnd,
+    /// Asks the client to resolve a credential (`client` source). May be
+    /// interleaved with `Stdout`/`Stderr` during a build.
+    CredentialRequest {
+        id: u64,
+        scope: Scope,
+        phase: Phase,
+    },
+    /// A credential decision, for the client's stderr line.
+    CredentialEvent(CredEvent),
+    /// Answer to `ClientMsg::Explain`.
+    ExplainResult {
+        steps: Vec<ExplainStep>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

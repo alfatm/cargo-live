@@ -3,17 +3,21 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use russh::client;
 use russh::{ChannelStream, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::sync::mpsc;
 
+use cargo_live_proto::cred::{Credential, CredentialPolicy, ExplainStep, Scope};
 use cargo_live_proto::{
-    parse_version, read_frame, write_frame, AgentMsg, BuildRequest, ClientMsg, Entry, SyncStats,
+    parse_version, write_frame, AgentMsg, BuildRequest, ClientMsg, Entry, FrameReader, SyncStats,
     WaitReason, Welcome, CHUNK_SIZE, PROTOCOL_VERSION,
 };
 
 use crate::config::AgentUrl;
+use crate::creds::resolve::ClientResolver;
 use crate::output::{handle_line, Emit};
 use crate::ssh::{self, Verifier};
 use crate::store::CachedBinary;
@@ -21,7 +25,7 @@ use crate::{error, Result};
 
 pub struct Remote {
     handle: client::Handle<Verifier>,
-    rd: ReadHalf<ChannelStream<client::Msg>>,
+    rd: FrameReader<ReadHalf<ChannelStream<client::Msg>>>,
     wr: WriteHalf<ChannelStream<client::Msg>>,
 }
 
@@ -41,7 +45,7 @@ impl Remote {
         let (rd, wr) = tokio::io::split(conn.stream);
         let mut remote = Self {
             handle: conn.handle,
-            rd,
+            rd: FrameReader::new(rd),
             wr,
         };
         remote
@@ -83,13 +87,20 @@ impl Remote {
     }
 
     async fn recv(&mut self) -> Result<AgentMsg> {
-        match read_frame(&mut self.rd).await {
-            Ok(Some(AgentMsg::Error { message })) => {
-                Err(error(format!("remote error: {message}")).into())
-            }
-            Ok(Some(msg)) => Ok(msg),
-            Ok(None) => Err(error("the agent closed the connection unexpectedly").into()),
-            Err(e) => Err(error(format!("lost connection to the agent: {e}")).into()),
+        received(self.rd.next().await)
+    }
+
+    /// Sends the credential policy (rules, `[forward]`, registries).
+    pub async fn send_policy(&mut self, policy: CredentialPolicy) -> Result<()> {
+        self.send(&ClientMsg::CredentialPolicy(policy)).await
+    }
+
+    /// Dry run of the agent's credential resolution for `scope`.
+    pub async fn explain(&mut self, scope: Scope) -> Result<Vec<ExplainStep>> {
+        self.send(&ClientMsg::Explain { scope }).await?;
+        match self.recv().await? {
+            AgentMsg::ExplainResult { steps } => Ok(steps),
+            other => Err(unexpected(&other)),
         }
     }
 
@@ -157,16 +168,44 @@ impl Remote {
     }
 
     /// Runs Cargo remotely, forwarding its output.
+    /// Credential requests from the agent are resolved in the background
+    /// (one at a time) while output keeps streaming.
     pub async fn build(
         &mut self,
         request: BuildRequest,
         remotes: &[&str],
         local: &Path,
+        resolver: Arc<ClientResolver>,
     ) -> Result<BuildResult> {
         let json_output = request.json_output;
         self.send(&ClientMsg::Build(request)).await?;
+        let (answers_tx, mut answers) = mpsc::channel::<(u64, Result<Credential, String>)>(8);
+        let one_at_a_time = Arc::new(std::sync::Mutex::new(()));
         let code = loop {
-            match self.recv().await? {
+            let msg = tokio::select! {
+                frame = self.rd.next::<AgentMsg>() => received(frame)?,
+                Some((id, result)) = answers.recv() => {
+                    self.send(&ClientMsg::CredentialResponse { id, result }).await?;
+                    continue;
+                }
+            };
+            match msg {
+                AgentMsg::CredentialRequest {
+                    id,
+                    scope,
+                    phase: _,
+                } => {
+                    let (resolver, tx, lock) =
+                        (resolver.clone(), answers_tx.clone(), one_at_a_time.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let _guard = lock.lock();
+                        let result = resolver.resolve(&scope);
+                        let _ = tx.blocking_send((id, result));
+                    });
+                }
+                AgentMsg::CredentialEvent(event) => {
+                    eprintln!("{}", crate::creds::event_line(&event));
+                }
                 AgentMsg::Stdout(line) => match handle_line(&line, json_output, remotes, local) {
                     Emit::Stdout(text) => {
                         let mut out = std::io::stdout().lock();
@@ -263,6 +302,19 @@ impl Remote {
     }
 }
 
+fn received(
+    frame: std::result::Result<Option<AgentMsg>, cargo_live_proto::FrameError>,
+) -> Result<AgentMsg> {
+    match frame {
+        Ok(Some(AgentMsg::Error { message })) => {
+            Err(error(format!("remote error: {message}")).into())
+        }
+        Ok(Some(msg)) => Ok(msg),
+        Ok(None) => Err(error("the agent closed the connection unexpectedly").into()),
+        Err(e) => Err(error(format!("lost connection to the agent: {e}")).into()),
+    }
+}
+
 fn unexpected(msg: &AgentMsg) -> Box<dyn std::error::Error + Send + Sync> {
     let name = match msg {
         AgentMsg::Welcome(_) => "Welcome",
@@ -278,6 +330,9 @@ fn unexpected(msg: &AgentMsg) -> Box<dyn std::error::Error + Send + Sync> {
         AgentMsg::BinaryInfo { .. } => "BinaryInfo",
         AgentMsg::BinaryChunk(_) => "BinaryChunk",
         AgentMsg::BinaryEnd => "BinaryEnd",
+        AgentMsg::CredentialRequest { .. } => "CredentialRequest",
+        AgentMsg::CredentialEvent(_) => "CredentialEvent",
+        AgentMsg::ExplainResult { .. } => "ExplainResult",
     };
     error(format!("protocol error: unexpected {name} from the agent")).into()
 }

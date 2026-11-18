@@ -4,14 +4,18 @@
 //! file > default. clap handles flag and environment; the file and defaults
 //! are folded in here.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 
+use crate::cred::config::{ProviderConfig, TokenPolicy};
+use crate::cred::AgentCreds;
 use crate::Result;
 
 #[derive(Debug, Parser)]
@@ -105,6 +109,15 @@ struct FileConfig {
     cargo: Option<PathBuf>,
     lock_timeout: Option<u64>,
     max_connections: Option<usize>,
+    /// Credential providers (`[[credentials]]`).
+    #[serde(default)]
+    credentials: Vec<ProviderConfig>,
+    /// Per-token credential policy (`[tokens.<name>]`).
+    #[serde(default)]
+    tokens: BTreeMap<String, TokenPolicy>,
+    /// Directory of the config file, for relative paths.
+    #[serde(skip)]
+    base: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +135,7 @@ pub struct Settings {
     pub cargo: PathBuf,
     pub lock_timeout: Duration,
     pub max_connections: usize,
+    pub creds: Arc<AgentCreds>,
 }
 
 const DEFAULT_DATA_DIR: &str = "/data";
@@ -150,6 +164,7 @@ fn load_file(common: &CommonArgs) -> Result<FileConfig> {
         toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", path.display()))?;
     // Relative paths in the file are relative to the file.
     let base = path.parent().unwrap_or(Path::new("."));
+    config.base = base.to_owned();
     for p in [
         &mut config.data_dir,
         &mut config.host_key,
@@ -200,9 +215,15 @@ pub fn paths(common: &CommonArgs) -> Result<Paths> {
 }
 
 pub fn settings(args: &ServeArgs) -> Result<Settings> {
-    let file = load_file(&args.common)?;
+    let mut file = load_file(&args.common)?;
     let paths = resolve_paths(&args.common, &file);
+    let creds = AgentCreds::from_config(
+        std::mem::take(&mut file.credentials),
+        std::mem::take(&mut file.tokens),
+        &file.base,
+    )?;
     let settings = Settings {
+        creds: Arc::new(creds),
         paths,
         listen: args
             .listen

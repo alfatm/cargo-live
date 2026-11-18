@@ -1,3 +1,4 @@
+mod cred;
 mod hostkey;
 mod job;
 mod log;
@@ -20,10 +21,23 @@ pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os();
-    let _ = args.next();
+    let argv0 = args.next().unwrap_or_default();
     let rest: Vec<_> = args.collect();
+    if std::path::Path::new(&argv0).file_name()
+        == Some(std::ffi::OsStr::new(cred::broker::DOCKER_HELPER_NAME))
+    {
+        return ExitCode::from(cred::helpers::docker_main(&rest) as u8);
+    }
     if rest.first().is_some_and(|a| a == "__runner") {
         return ExitCode::from(runner::main(rest[1..].to_vec()) as u8);
+    }
+    if rest.first().is_some_and(|a| a == "__cred") {
+        return ExitCode::from(cred::helpers::cred_main(&rest[1..]) as u8);
+    }
+    // Cargo runs credential providers as `<path> --cargo-plugin`; the
+    // alias arguments (`__cred cargo`) arrive in the request's `args`.
+    if rest.first().is_some_and(|a| a == "--cargo-plugin") {
+        return ExitCode::from(cred::helpers::cred_main(&["cargo".into()]) as u8);
     }
     let cli = Cli::parse();
     match run(cli) {

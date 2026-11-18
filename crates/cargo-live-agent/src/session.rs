@@ -11,11 +11,13 @@ use russh::server::Msg;
 use russh::ChannelStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use cargo_live_proto::cred::CredentialPolicy;
 use cargo_live_proto::{
-    is_token_name, is_workspace_id, read_frame, write_frame, AgentMsg, ClientMsg, SyncStats,
+    is_token_name, is_workspace_id, write_frame, AgentMsg, ClientMsg, FrameReader, SyncStats,
     WaitReason, Welcome, CHUNK_SIZE, PROTOCOL_VERSION,
 };
 
+use crate::cred::CredSession;
 use crate::mirror;
 use crate::server::Shared;
 use crate::{job, log, Result};
@@ -37,16 +39,24 @@ pub struct Context {
     pub peer: SocketAddr,
     pub workspace: Option<Workspace>,
     pub run_target: Option<String>,
+    pub creds: Arc<CredSession>,
 }
 
 pub async fn run(shared: Arc<Shared>, token: String, peer: SocketAddr, stream: ChannelStream<Msg>) {
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut rd = FrameReader::new(rd);
+    let creds = Arc::new(CredSession::new(
+        token.clone(),
+        shared.settings.creds.clone(),
+        shared.settings.paths.data_dir.join("audit.log"),
+    ));
     let mut ctx = Context {
         shared,
         token,
         peer,
         workspace: None,
         run_target: None,
+        creds,
     };
     if let Err(e) = ctx.serve(&mut rd, &mut wr).await {
         log!("{peer} [{}]: {e}", ctx.token);
@@ -61,12 +71,12 @@ pub async fn run(shared: Arc<Shared>, token: String, peer: SocketAddr, stream: C
 }
 
 impl Context {
-    async fn serve<R, W>(&mut self, rd: &mut R, wr: &mut W) -> Result<()>
+    async fn serve<R, W>(&mut self, rd: &mut FrameReader<R>, wr: &mut W) -> Result<()>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        match read_frame(rd).await? {
+        match rd.next().await? {
             Some(ClientMsg::Hello {
                 protocol_version,
                 client_version,
@@ -93,7 +103,7 @@ impl Context {
         write_frame(wr, &AgentMsg::Welcome(welcome)).await?;
 
         loop {
-            let Some(msg) = read_frame::<_, ClientMsg>(rd).await? else {
+            let Some(msg) = rd.next::<ClientMsg>().await? else {
                 return Ok(());
             };
             match msg {
@@ -102,6 +112,7 @@ impl Context {
                         return Err("workspace already open".into());
                     }
                     let ws = self.open(&workspace_id, rd, wr).await?;
+                    self.creds.set_workspace(&workspace_id);
                     write_frame(
                         wr,
                         &AgentMsg::Opened {
@@ -126,7 +137,8 @@ impl Context {
                         request.args,
                         request.relative_cwd
                     );
-                    let outcome = job::build(&self.shared, ws, &request, rd, wr).await?;
+                    let outcome =
+                        job::build(&self.shared, ws, &request, &self.creds, rd, wr).await?;
                     log!(
                         "{} [{}]: cargo exited with {}",
                         self.peer,
@@ -149,12 +161,27 @@ impl Context {
                     }
                     self.fetch(&executable, known_blake3, wr).await?;
                 }
+                ClientMsg::CredentialPolicy(policy) => {
+                    validate_policy(&policy)?;
+                    log!(
+                        "{} [{}]: credential policy: {} rules, {} registry config entries",
+                        self.peer,
+                        self.token,
+                        policy.rules.len(),
+                        policy.registries_config.len()
+                    );
+                    self.creds.set_policy(policy);
+                }
+                ClientMsg::Explain { scope } => {
+                    let steps = self.creds.explain(&scope);
+                    write_frame(wr, &AgentMsg::ExplainResult { steps }).await?;
+                }
                 other => return Err(format!("unexpected message {}", msg_name(&other)).into()),
             }
         }
     }
 
-    async fn open<R, W>(&self, id: &str, rd: &mut R, wr: &mut W) -> Result<Workspace>
+    async fn open<R, W>(&self, id: &str, rd: &mut FrameReader<R>, wr: &mut W) -> Result<Workspace>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -185,7 +212,6 @@ impl Context {
         let mut announced = false;
         // The client sends nothing until `Opened`: any message, EOF or error
         // while waiting means it gave up (or the connection dropped).
-        let mut incoming = Box::pin(read_frame::<_, ClientMsg>(rd));
         loop {
             match lock.try_lock() {
                 Ok(()) => break,
@@ -209,7 +235,7 @@ impl Context {
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(200)) => {}
-                        _ = &mut incoming => {
+                        _ = rd.next::<ClientMsg>() => {
                             return Err(
                                 "client disconnected while waiting for the workspace lock".into()
                             )
@@ -256,7 +282,7 @@ impl Context {
     async fn sync<R, W>(
         &self,
         entries: Vec<cargo_live_proto::Entry>,
-        rd: &mut R,
+        rd: &mut FrameReader<R>,
         wr: &mut W,
     ) -> Result<SyncStats>
     where
@@ -293,7 +319,7 @@ impl Context {
                 .await?;
             let mut size = 0u64;
             let ok = loop {
-                match read_frame(rd).await? {
+                match rd.next().await? {
                     Some(ClientMsg::FileChunk(data)) => {
                         size += data.len() as u64;
                         file.write_all(&data).await?;
@@ -422,7 +448,40 @@ fn msg_name(msg: &ClientMsg) -> &'static str {
         ClientMsg::FileEnd { .. } => "FileEnd",
         ClientMsg::Build(_) => "Build",
         ClientMsg::Fetch { .. } => "Fetch",
+        ClientMsg::CredentialPolicy(_) => "CredentialPolicy",
+        ClientMsg::CredentialResponse { .. } => "CredentialResponse",
+        ClientMsg::Explain { .. } => "Explain",
     }
+}
+
+/// Checks a client's credential policy. Registry entries become `--config`
+/// arguments of remote Cargo, so only registry definitions are accepted.
+pub fn validate_policy(policy: &CredentialPolicy) -> Result<()> {
+    policy
+        .validate()
+        .map_err(|e| format!("invalid credential policy: {e}"))?;
+    for entry in &policy.registries_config {
+        let table: toml::Table = toml::from_str(entry)
+            .map_err(|_| format!("invalid registry config entry {entry:?}"))?;
+        let ok = table.iter().all(|(key, value)| match key.as_str() {
+            "registries" | "source" => true,
+            "registry" => value
+                .as_table()
+                .is_some_and(|t| t.keys().all(|k| k == "default")),
+            _ => false,
+        });
+        if !ok || table.is_empty() {
+            return Err(format!(
+                "registry config entry {entry:?} may only set registries.*, source.* or \
+                 registry.default"
+            )
+            .into());
+        }
+        if entry.contains("credential-provider") || entry.contains("token") {
+            return Err(format!("registry config entry {entry:?} must not set credentials").into());
+        }
+    }
+    Ok(())
 }
 
 async fn welcome(cargo: &Path) -> Welcome {
@@ -470,6 +529,29 @@ mod tests {
         assert!(checked_executable(&target, &target.join("debug/../../secret")).is_err());
         assert!(checked_executable(&target, &target.join("debug")).is_err());
         assert!(checked_executable(&target, Path::new("debug/app")).is_err());
+    }
+
+    #[test]
+    fn policy_registry_entries_are_restricted() {
+        let mut policy = CredentialPolicy::default();
+        for good in [
+            "registries.\"acme\".index = \"sparse+https://r/\"",
+            "source.\"crates-io\".replace-with = \"mirror\"",
+            "registry.default = \"acme\"",
+        ] {
+            policy.registries_config = vec![good.into()];
+            assert!(validate_policy(&policy).is_ok(), "{good}");
+        }
+        for bad in [
+            "build.rustflags = [\"-C\", \"x\"]",
+            "registry.token = \"x\"",
+            "registries.acme.token = \"x\"",
+            "registries.acme.credential-provider = \"/bin/evil\"",
+            "not toml",
+        ] {
+            policy.registries_config = vec![bad.into()];
+            assert!(validate_policy(&policy).is_err(), "{bad}");
+        }
     }
 
     #[test]

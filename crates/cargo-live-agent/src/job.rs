@@ -2,19 +2,23 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use cargo_live_proto::cred::{Credential, Phase};
 use cargo_live_proto::{
-    read_frame, validate_relative_path, write_frame, AgentMsg, BuildCommand, BuildRequest,
-    ClientMsg, WaitReason,
+    validate_relative_path, write_frame, AgentMsg, BuildCommand, BuildRequest, ClientMsg,
+    FrameReader, WaitReason,
 };
 
+use crate::cred::broker::{BROKER_ENV, NONCE_ENV};
+use crate::cred::{Broker, CredSession, ToClient};
 use crate::runner::{RunnerOutput, OUT_ENV};
 use crate::server::Shared;
 use crate::session::Workspace;
@@ -62,54 +66,40 @@ pub fn runner_config(host_triple: &str, agent_exe: &Path) -> Result<String> {
     ))
 }
 
-pub fn cargo_command(
-    shared: &Shared,
-    ws: &Workspace,
-    request: &BuildRequest,
-    host_triple: &str,
-) -> Result<Command> {
-    check_args(request)?;
-    let cwd = if request.relative_cwd.is_empty() {
-        ws.source.clone()
-    } else {
-        validate_relative_path(&request.relative_cwd)
-            .map_err(|e| format!("invalid working directory: {e}"))?;
-        let path = mirror::resolve(&ws.source, &request.relative_cwd)?;
-        match fs::symlink_metadata(&path) {
-            Ok(md) if md.file_type().is_dir() => path,
-            _ => return Err("working directory is not a directory in the mirror".into()),
-        }
-    };
+/// Cargo's working directory in the mirror.
+fn working_dir(ws: &Workspace, request: &BuildRequest) -> Result<PathBuf> {
+    if request.relative_cwd.is_empty() {
+        return Ok(ws.source.clone());
+    }
+    validate_relative_path(&request.relative_cwd)
+        .map_err(|e| format!("invalid working directory: {e}"))?;
+    let path = mirror::resolve(&ws.source, &request.relative_cwd)?;
+    match fs::symlink_metadata(&path) {
+        Ok(md) if md.file_type().is_dir() => Ok(path),
+        _ => Err("working directory is not a directory in the mirror".into()),
+    }
+}
+
+/// A Cargo command with the settings shared by both steps.
+fn base_command(shared: &Shared, ws: &Workspace, request: &BuildRequest, cwd: &Path) -> Command {
     let mut cmd = Command::new(&shared.settings.cargo);
     if let Some(toolchain) = &request.toolchain {
         cmd.arg(format!("+{toolchain}"));
     }
-    match request.command {
-        BuildCommand::Run => {
-            cmd.arg("run").args(&request.args);
-            cmd.arg("--message-format=json");
-            cmd.arg("--config")
-                .arg(runner_config(host_triple, &shared.agent_exe)?);
-            cmd.env(OUT_ENV, &ws.runner_out);
-        }
-        BuildCommand::Check => {
-            cmd.arg("check").args(&request.args);
-            if !request
-                .args
-                .iter()
-                .any(|a| a.starts_with("--message-format"))
-            {
-                cmd.arg("--message-format=json");
-            }
-        }
-    }
     cmd.current_dir(cwd)
         .env("CARGO_TARGET_DIR", &ws.target)
+        // Only a broker for this step may set these.
+        .env_remove(BROKER_ENV)
+        .env_remove(NONCE_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
+    // Root secrets of `env` providers must not reach build scripts.
+    for var in shared.settings.creds.secret_env_vars() {
+        cmd.env_remove(var);
+    }
     #[cfg(target_os = "linux")]
     // SAFETY: prctl is async-signal-safe.
     unsafe {
@@ -120,6 +110,86 @@ pub fn cargo_command(
             Ok(())
         });
     }
+    cmd
+}
+
+/// The user's options that also apply to `cargo fetch`.
+pub fn fetch_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--locked" | "--frozen" | "--offline" => out.push(arg.clone()),
+            "--config" | "-Z" => {
+                out.push(arg.clone());
+                if let Some(value) = iter.next() {
+                    out.push(value.clone());
+                }
+            }
+            a if a.starts_with("--config=") || (a.starts_with("-Z") && a.len() > 2) => {
+                out.push(arg.clone())
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn config_args(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|e| ["--config".to_owned(), e.clone()])
+        .collect()
+}
+
+/// Step 1: `cargo fetch` with the forwarded options.
+pub fn fetch_command(
+    shared: &Shared,
+    ws: &Workspace,
+    request: &BuildRequest,
+    cwd: &Path,
+    registries: &[String],
+) -> Command {
+    let mut cmd = base_command(shared, ws, request, cwd);
+    cmd.arg("fetch")
+        .args(config_args(registries))
+        .args(fetch_args(&request.args));
+    cmd
+}
+
+/// Step 2: `cargo run` / `cargo check`.
+pub fn cargo_command(
+    shared: &Shared,
+    ws: &Workspace,
+    request: &BuildRequest,
+    host_triple: &str,
+    cwd: &Path,
+    registries: &[String],
+) -> Result<Command> {
+    let mut cmd = base_command(shared, ws, request, cwd);
+    match request.command {
+        BuildCommand::Run => {
+            cmd.arg("run")
+                .args(config_args(registries))
+                .args(&request.args);
+            cmd.arg("--message-format=json");
+            cmd.arg("--config")
+                .arg(runner_config(host_triple, &shared.agent_exe)?);
+            cmd.env(OUT_ENV, &ws.runner_out);
+        }
+        BuildCommand::Check => {
+            cmd.arg("check")
+                .args(config_args(registries))
+                .args(&request.args);
+            if !request
+                .args
+                .iter()
+                .any(|a| a.starts_with("--message-format"))
+            {
+                cmd.arg("--message-format=json");
+            }
+        }
+    }
     Ok(cmd)
 }
 
@@ -127,19 +197,19 @@ pub async fn build<R, W>(
     shared: &Shared,
     ws: &Workspace,
     request: &BuildRequest,
-    rd: &mut R,
+    creds: &Arc<CredSession>,
+    rd: &mut FrameReader<R>,
     wr: &mut W,
 ) -> Result<Outcome>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    check_args(request)?;
     let host_triple = host_triple(&shared.settings.cargo).await;
-    let mut cmd = cargo_command(shared, ws, request, &host_triple)?;
+    let cwd = working_dir(ws, request)?;
+    let registries = creds.registries_config();
     let _ = fs::remove_file(&ws.runner_out);
-
-    // Any message or EOF from the client during the build means it gave up.
-    let mut incoming = Box::pin(read_frame::<_, ClientMsg>(rd));
 
     let _permit = match shared.builds.try_acquire() {
         Ok(permit) => permit,
@@ -151,13 +221,86 @@ where
                 },
             )
             .await?;
+            // Any message or EOF from the client while waiting means it
+            // gave up.
             tokio::select! {
                 permit = shared.builds.acquire() => permit?,
-                _ = &mut incoming => return Err("client disconnected".into()),
+                _ = rd.next::<ClientMsg>() => return Err("client disconnected".into()),
             }
         }
     };
 
+    // Step 1: `cargo fetch` with the broker open. No third-party code runs
+    // in this step.
+    let mut fetch = fetch_command(shared, ws, request, &cwd, &registries);
+    let (client_tx, client_rx) = mpsc::channel(16);
+    let broker = Broker::start(
+        &ws.tmp,
+        Phase::Fetch,
+        creds.clone(),
+        client_tx,
+        &shared.agent_exe,
+    )?;
+    let extra = broker.configure(&mut fetch, &shared.agent_exe, &creds.git_hosts())?;
+    fetch.args(extra);
+    let code = run_step(shared, fetch, client_rx, rd, wr).await;
+    drop(broker);
+    let code = code?;
+    if code != 0 {
+        let message = format!(
+            "cargo-live-agent: `cargo fetch` failed (exit code {code}); the build was not started\n"
+        );
+        write_frame(wr, &AgentMsg::Stderr(message.into_bytes())).await?;
+        return Ok(Outcome {
+            code,
+            run_target: None,
+        });
+    }
+
+    // Step 2: the build, which runs build scripts and proc macros. The
+    // broker is only open if some scope opted into the build phase; each
+    // request is still checked against that scope's phases.
+    let mut cmd = cargo_command(shared, ws, request, &host_triple, &cwd, &registries)?;
+    let (client_tx, client_rx) = mpsc::channel(16);
+    let broker = if creds.build_phase_enabled() {
+        let broker = Broker::start(
+            &ws.tmp,
+            Phase::Build,
+            creds.clone(),
+            client_tx,
+            &shared.agent_exe,
+        )?;
+        let extra = broker.configure(&mut cmd, &shared.agent_exe, &creds.git_hosts())?;
+        cmd.args(extra);
+        Some(broker)
+    } else {
+        drop(client_tx);
+        None
+    };
+    let code = run_step(shared, cmd, client_rx, rd, wr).await;
+    drop(broker);
+    let code = code?;
+    let run_target = if request.command == BuildCommand::Run && code == 0 {
+        Some(read_runner_output(&ws.runner_out)?)
+    } else {
+        None
+    };
+    Ok(Outcome { code, run_target })
+}
+
+/// Runs one Cargo step, streaming its output and relaying credential
+/// requests to the client. Returns Cargo's exit code.
+async fn run_step<R, W>(
+    shared: &Shared,
+    mut cmd: Command,
+    mut client_rx: mpsc::Receiver<ToClient>,
+    rd: &mut FrameReader<R>,
+    wr: &mut W,
+) -> Result<i32>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", shared.settings.cargo.display()))?;
@@ -192,36 +335,53 @@ where
         }
     });
 
+    let mut pending: HashMap<u64, oneshot::Sender<std::result::Result<Credential, String>>> =
+        HashMap::new();
+    let mut next_id = 0u64;
     let result: Result<ExitStatus> = async {
+        let mut output_open = true;
+        let mut status = None;
         loop {
-            tokio::select! {
-                msg = rx.recv() => match msg {
-                    Some(msg) => write_frame(wr, &msg).await?,
-                    None => break,
-                },
-                _ = &mut incoming => return Err("client disconnected during the build".into()),
+            if let (false, Some(status)) = (output_open, status) {
+                return Ok(status);
             }
-        }
-        tokio::select! {
-            status = child.wait() => Ok(status?),
-            _ = &mut incoming => Err("client disconnected during the build".into()),
+            tokio::select! {
+                msg = rx.recv(), if output_open => match msg {
+                    Some(msg) => write_frame(wr, &msg).await?,
+                    None => output_open = false,
+                },
+                exited = child.wait(), if status.is_none() => status = Some(exited?),
+                Some(call) = client_rx.recv() => match call {
+                    ToClient::Request { scope, phase, reply } => {
+                        next_id += 1;
+                        pending.insert(next_id, reply);
+                        write_frame(wr, &AgentMsg::CredentialRequest { id: next_id, scope, phase })
+                            .await?;
+                    }
+                    ToClient::Event(event) => {
+                        write_frame(wr, &AgentMsg::CredentialEvent(event)).await?
+                    }
+                },
+                frame = rd.next::<ClientMsg>() => match frame {
+                    Ok(Some(ClientMsg::CredentialResponse { id, result })) => {
+                        if let Some(reply) = pending.remove(&id) {
+                            let _ = reply.send(result);
+                        }
+                    }
+                    Ok(Some(_)) => return Err("unexpected message from the client during the build".into()),
+                    Ok(None) | Err(_) => return Err("client disconnected during the build".into()),
+                },
+            }
         }
     }
     .await;
-    let status = match result {
-        Ok(status) => status,
+    match result {
+        Ok(status) => Ok(exit_code(status)),
         Err(e) => {
             terminate(&mut child, pgid).await;
-            return Err(e);
+            Err(e)
         }
-    };
-    let code = exit_code(status);
-    let run_target = if request.command == BuildCommand::Run && code == 0 {
-        Some(read_runner_output(&ws.runner_out)?)
-    } else {
-        None
-    };
-    Ok(Outcome { code, run_target })
+    }
 }
 
 fn is_runner_status(line: &[u8]) -> bool {
@@ -354,6 +514,43 @@ mod tests {
         let mut r = request(BuildCommand::Run, &[]);
         r.toolchain = Some("nightly; rm -rf /".into());
         assert!(check_args(&r).is_err());
+    }
+
+    #[test]
+    fn fetch_gets_only_the_relevant_options() {
+        let args: Vec<String> = [
+            "--release",
+            "--locked",
+            "--config",
+            "a=1",
+            "--config=b=2",
+            "-Z",
+            "x",
+            "-Zy",
+            "--bin",
+            "app",
+            "--offline",
+            "--frozen",
+            "-p",
+            "z",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            fetch_args(&args),
+            [
+                "--locked",
+                "--config",
+                "a=1",
+                "--config=b=2",
+                "-Z",
+                "x",
+                "-Zy",
+                "--offline",
+                "--frozen"
+            ]
+        );
     }
 
     #[test]

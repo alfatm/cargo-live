@@ -4,6 +4,7 @@ use std::io;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroize;
 
 /// Largest accepted frame payload.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -56,8 +57,11 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let frame = encode(msg)?;
-    writer.write_all(&frame).await?;
+    let mut frame = encode(msg)?;
+    let result = writer.write_all(&frame).await;
+    // Frames may carry credentials; do not leave copies in freed memory.
+    frame.zeroize();
+    result?;
     writer.flush().await?;
     Ok(())
 }
@@ -86,7 +90,69 @@ where
     }
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload).await?;
-    decode(&payload).map(Some)
+    let result = decode(&payload).map(Some);
+    payload.zeroize();
+    result
+}
+
+/// Buffered frame reader whose [`FrameReader::next`] is cancel safe, so it
+/// can be used as a branch of `tokio::select!` in a loop: a cancelled call
+/// loses no data. Consumed frames are zeroed in the buffer.
+pub struct FrameReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Reads the next frame. Returns `None` on a clean end of stream
+    /// between frames.
+    pub async fn next<T: DeserializeOwned>(&mut self) -> Result<Option<T>, FrameError> {
+        loop {
+            if self.buf.len() >= 4 {
+                let len = u32::from_be_bytes(self.buf[..4].try_into().expect("4 bytes")) as usize;
+                if len > MAX_FRAME {
+                    return Err(FrameError::TooLarge(len));
+                }
+                if self.buf.len() >= 4 + len {
+                    let result = decode(&self.buf[4..4 + len]).map(Some);
+                    let total = self.buf.len();
+                    self.buf[..4 + len].zeroize();
+                    self.buf.drain(..4 + len);
+                    // The tail moved down; clear its stale copy.
+                    let new_len = self.buf.len();
+                    let spare = self.buf.spare_capacity_mut();
+                    for byte in &mut spare[..total - new_len] {
+                        byte.write(0);
+                    }
+                    return result;
+                }
+                self.buf.reserve(4 + len - self.buf.len());
+            } else {
+                self.buf.reserve(64 * 1024);
+            }
+            // `read_buf` is cancel safe: if cancelled, nothing was read.
+            let n = self.inner.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+            }
+        }
+    }
+}
+
+impl<R> Drop for FrameReader<R> {
+    fn drop(&mut self) {
+        self.buf.zeroize();
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +228,35 @@ mod tests {
             .await
             .is_err());
         assert!(read_frame::<_, AgentMsg>(&mut &frame[..2]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_handles_split_and_batched_frames() {
+        let mut buf = Vec::new();
+        for code in 0..5 {
+            write_frame(&mut buf, &AgentMsg::Exit { code })
+                .await
+                .unwrap();
+        }
+        write_frame(&mut buf, &AgentMsg::BinaryChunk(vec![7; 200_000]))
+            .await
+            .unwrap();
+        // Deliver in odd-sized pieces.
+        let (mut tx, rx) = tokio::io::duplex(37);
+        let feeder = tokio::spawn(async move {
+            for piece in buf.chunks(13) {
+                tx.write_all(piece).await.unwrap();
+            }
+        });
+        let mut reader = FrameReader::new(rx);
+        for code in 0..5 {
+            let msg: AgentMsg = reader.next().await.unwrap().unwrap();
+            assert_eq!(msg, AgentMsg::Exit { code });
+        }
+        let msg: AgentMsg = reader.next().await.unwrap().unwrap();
+        assert_eq!(msg, AgentMsg::BinaryChunk(vec![7; 200_000]));
+        feeder.await.unwrap();
+        assert!(reader.next::<AgentMsg>().await.unwrap().is_none());
     }
 
     #[test]

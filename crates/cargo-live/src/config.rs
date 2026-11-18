@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use cargo_live_proto::{ExcludeSet, DEFAULT_PORT};
 
+use crate::creds::ProjectRule;
 use crate::{error, Result};
 
 #[derive(Debug, Deserialize)]
@@ -14,6 +15,9 @@ pub struct Config {
     pub remote: Remote,
     #[serde(default)]
     pub sync: Sync,
+    /// Credential source hints (`[[credentials]]` with match + sources).
+    #[serde(default)]
+    pub credentials: Vec<ProjectRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +148,9 @@ impl Config {
             }
         }
         self.excludes()?;
+        for hint in &self.credentials {
+            hint.validate()?;
+        }
         Ok(())
     }
 }
@@ -186,6 +193,11 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(good.url().unwrap().to_string(), "build:2222");
+        let hints = Config::parse(
+            "[remote]\nurl = 'a'\n[[credentials]]\nmatch = { kind = 'git', host = 'github.com' }\nsources = ['agent', 'client']\n",
+        )
+        .unwrap();
+        assert_eq!(hints.credentials.len(), 1);
         for text in [
             "[remote]\nhost = 'old'\nbase_dir = '/x'\n",
             "[remote]\nurl = 'a;b'\n",
@@ -193,6 +205,10 @@ mod tests {
             "[remote]\nurl = 'a'\n[sync]\nexclude = ['']\n",
             "[remote]\nurl = 'a'\n[sync]\nexclude = ['/']\n",
             "[remote]\nurl = 'a'\nunknown = 1\n",
+            // Project hints cannot set phases or extend [forward].
+            "[remote]\nurl = 'a'\n[[credentials]]\nmatch = { kind = 'git' }\nsources = ['client']\nphases = ['build']\n",
+            "[remote]\nurl = 'a'\n[forward]\ngit = ['*']\n",
+            "[remote]\nurl = 'a'\n[[credentials]]\nmatch = { kind = 'git' }\nsources = []\n",
         ] {
             assert!(Config::parse(text).is_err(), "{text}");
         }

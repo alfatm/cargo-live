@@ -36,7 +36,9 @@ One build is one SSH connection:
 4. Incremental sync: the client sends a listing (paths, sizes, mtimes,
    modes, symlinks); the agent asks only for changed files and deletes files
    that disappeared locally.
-5. The agent runs `cargo run` / `cargo check` and streams the output back.
+5. The agent runs `cargo fetch` (with the credential broker open, see
+   [Credentials](#credentials)), then `cargo run` / `cargo check`, and
+   streams the output back.
 6. For `run`, the agent records which executable Cargo would start (via a
    runner hook, so Cargo's own target selection, `default-run`, `--bin`,
    `--example` all apply). The client downloads it (skipped when the cached
@@ -151,6 +153,9 @@ default:
   immediately and logged. `lock_timeout` is how long a build waits for a busy
   workspace before failing.
 
+`agent.toml` also holds credential providers (`[[credentials]]`) and
+per-token policies (`[tokens.<name>]`), see [Credentials](#credentials).
+
 Example `/data/agent.toml`:
 
 ```toml
@@ -190,6 +195,7 @@ cargo-live-agent fingerprint      # prints it (generates the key if missing)
 ```
 <data_dir>/host_key                   Ed25519 host key (0600)
 <data_dir>/tokens.toml                token names and hashes (0600)
+<data_dir>/audit.log                  credential decisions, JSON lines (0600)
 <data_dir>/workspaces/<token>/<workspace-id>/
     source/   mirror of the local workspace, managed by the agent
     target/   Cargo target directory, kept for incremental builds
@@ -299,6 +305,298 @@ check, the client disconnects and the agent stops the remote build and
 releases the workspace lock. Rust-analyzer's build-script and proc-macro
 preparation is **not** redirected and still runs locally.
 
+## Credentials
+
+Builds on the agent often need credentials: private git dependencies
+(GitHub, GitLab, self-hosted), private Cargo registries, Docker registries.
+cargo-live brokers them per job. Secrets are never baked into the image,
+never written to disk on the agent, and never put into the environment of
+build processes.
+
+### Model
+
+There are two sources, which you can mix per scope:
+
+- **`agent`**: providers configured on the agent (shared/org credentials,
+  short-lived tokens such as GitHub App installation tokens). Their root
+  secrets come from mounted files or environment variables (Docker/Kubernetes
+  secrets) or from external commands.
+- **`client`**: forwarded on demand from your machine over the existing SSH
+  connection (like ssh-agent forwarding, but for tokens), resolved with your
+  local tools (`git credential fill`, Cargo's credentials, Docker credential
+  helpers). Your machine only hands out what its `[forward]` allowlist
+  permits.
+
+A **scope** is what a credential is for: `git` (host + repository path, e.g.
+`github.com` + `acme/foo`, `.git` stripped), `cargo` (registry name and/or
+index URL) or `docker` (registry host).
+
+**Resolution**, for each request the agent receives:
+
+1. The best matching client rule: rules from your user config first, then
+   project hints; within each, the most specific match (more fields, then
+   more literal characters) wins; ties go to the first. Without a rule the
+   sources are `["agent", "client"]`, where `client` only applies if the
+   scope is in your `[forward]`.
+2. The current phase must be in the rule's `phases` (default `["fetch"]`).
+3. Sources are tried in order. `agent` is the first agent provider whose
+   `match` fits, whose `allow_tokens` includes your token and whose `phases`
+   allow the phase. `client` is skipped if your token has
+   `allow_client = false` or the scope is not in `[forward]`; otherwise your
+   machine is asked, and it checks `[forward]` again itself.
+4. The first success wins; failures fall through to the next source.
+   Successes are cached in memory for the rest of the connection (until
+   shortly before they expire); nothing is cached across connections or
+   tokens, and failures are never cached.
+
+**Phase gating.** Every build runs in two steps:
+
+1. `cargo fetch` (with your `+toolchain`, `--locked`, `--frozen`,
+   `--offline`, `--config` and `-Z` options) with the credential broker
+   open. No third-party code runs in this step.
+2. `cargo run` / `cargo check`, which runs build scripts and proc macros
+   (third-party code), with the broker **closed**, except for scopes whose
+   effective `phases` include `build`.
+
+So dependencies' build scripts never see your credentials unless you opt a
+scope in, for example a `build.rs` that pulls from a private Docker
+registry. A failing fetch fails the build ("`cargo fetch` failed ... the
+build was not started"). Output of both steps is streamed as usual.
+
+How it works on the agent: for each step that may receive credentials the
+agent creates a Unix socket `<workspace>/tmp/cred-<id>.sock` (mode 0600)
+and a random nonce, passed to Cargo as `CARGO_LIVE_BROKER` and
+`CARGO_LIVE_BROKER_NONCE`. Helper modes of the agent binary connect to it:
+
+- **git**: Cargo gets `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`
+  entries (appended after existing ones) that clear inherited credential
+  helpers, set `credential.helper = !<agent> __cred git` and
+  `credential.useHttpPath = true`, and rewrite `git@<host>:` and
+  `ssh://git@<host>/` to `https://<host>/` for github.com and every literal
+  host your rules, `[forward]` and the agent's providers mention, so SSH
+  dependency URLs need no SSH keys. `CARGO_NET_GIT_FETCH_WITH_CLI=true` and
+  `GIT_TERMINAL_PROMPT=0` are set.
+- **Cargo registries**: the agent is registered as a credential provider
+  (`--config credential-alias.cargo-live=[...]` and
+  `registry.global-credential-providers=["cargo-live"]`) and answers `get`
+  requests with `cache = "expires"` when the expiry is known, otherwise
+  `"never"`; `login`/`logout` are refused.
+- **Docker registries**: `DOCKER_CONFIG` points at a per-step
+  `config.json` with `{"credsStore": "cargo-live"}`, and a per-step `bin`
+  directory first in `PATH` contains `docker-credential-cargo-live`, a
+  symlink to the agent, which acts as a Docker credential helper (`get`;
+  `store`/`erase`/`list` do nothing). Giving builds access to a Docker
+  daemon is out of scope, and dangerous: the Docker socket is root on the
+  host.
+
+The socket and the per-step directory are removed when the step ends. A
+helper whose request fails gets a generic error; the reasons go to the
+agent log, the audit log and your terminal.
+
+**Registry definitions.** `[registries]`, `[source]` and
+`registry.default` from your Cargo home config (`$CARGO_HOME/config.toml`
+or `config`, including files it `include`s, and `.cargo/config.toml` files
+in directories above the workspace) are not synced, because only the
+workspace is. The client sends them (never tokens or credential providers)
+and the agent passes them to remote Cargo as `--config` entries. Entries
+that the workspace's own `.cargo/config.toml` defines are left to it, and
+local sources (`directory`, `local-registry`) are not sent.
+
+### Client configuration
+
+`$XDG_CONFIG_HOME/cargo-live/config.toml` (default
+`~/.config/cargo-live/config.toml`; never put it in the repository):
+
+```toml
+[forward]                         # allowlist: what this machine may hand out
+git = ["github.com/alfatm/*", "gitlab.acme.dev/*"]   # host/path globs; "host" alone = whole host
+cargo = ["acme"]                  # registry names or index URLs
+docker = []                       # registry hosts
+# interactive = false             # let git credential helpers prompt on a terminal
+
+[[forward.command]]               # optional custom resolver for matching scopes
+match = { kind = "git", host = "gitlab.acme.dev" }
+command = ["glab", "auth", "token"]   # no shell; stdout = secret, or JSON {secret, username?, expires_at?}
+# timeout = 60
+
+[[credentials]]
+match = { kind = "git", host = "github.com", path = "acme/*" }
+sources = ["agent"]
+[[credentials]]
+match = { kind = "git", host = "github.com", path = "alfatm/*" }
+sources = ["client"]
+[[credentials]]
+match = { kind = "cargo", registry = "acme" }
+sources = ["agent", "client"]
+phases = ["fetch"]                # optional, default ["fetch"]; add "build" to opt in
+```
+
+`match` takes `kind` plus `host` and `path` (git), `registry` and `index`
+(cargo) or `host` (docker); values are globs where `*` matches anything
+(including `/`). A `[[forward.command]]` gets the request as JSON on stdin
+(`{"kind": "git", "protocol": ..., "host": ..., "path": ...}`, or
+`registry`/`index` for cargo, `host` for docker); `expires_at` is Unix
+seconds or RFC 3339.
+
+Without a matching `[[forward.command]]` your machine resolves forwarded
+requests with:
+
+- git: `git credential fill` with protocol, host and path
+  (`GIT_TERMINAL_PROMPT=0` unless `interactive = true`); username, password
+  and `password_expiry_utc` are used. Whether helpers see the path depends
+  on your `credential.useHttpPath`.
+- cargo: `CARGO_REGISTRIES_<NAME>_TOKEN`, then `$CARGO_HOME/credentials.toml`
+  (`[registries.<name>] token`), then the registry's credential providers
+  from your Cargo config (`registries.<name>.credential-provider` or
+  `registry.global-credential-providers`, aliases resolved), run with the
+  credential provider protocol. `cargo:token-from-stdout` is supported; other
+  built-in `cargo:` providers (`libsecret`, `macos-keychain`, `wincred`) are
+  not; use `[[forward.command]]` for those.
+- docker: `credHelpers[host]`, then `auths[host].auth`, then `credsStore`
+  from `~/.docker/config.json` (or `$DOCKER_CONFIG`), via
+  `docker-credential-<helper> get`.
+
+**Project hints.** `.cargo/live.toml` may contain `[[credentials]]` with
+`match` and `sources` only. They rank below your user rules and can never
+extend `[forward]` or set `phases`:
+
+```toml
+[[credentials]]
+match = { kind = "git", host = "gitlab.acme.dev" }
+sources = ["client"]
+```
+
+Each credential served prints one line, and a failure prints the chain
+tried:
+
+```
+cargo-live: credential for git github.com/acme/foo from agent (acme-github) (fetch phase)
+cargo-live: no credential for git github.com/acme/bar: agent → not allowed for token "alice" (acme-github); client → not in [forward]
+```
+
+### Agent providers
+
+Providers are `[[credentials]]` tables in `agent.toml`. Every provider has
+`name` (used in logs and `creds explain`), `match`, `provider`,
+`allow_tokens` (required; token-name globs, `["*"]` for all) and optional
+`phases` (a cap on top of the client's rules). Root secrets are references,
+`{ file = "..." }` or `{ env = "NAME" }`; inline secret values are rejected.
+Relative paths are relative to the config file. The configuration is read at
+startup. Environment variables named by `env` providers and `{ env = ... }`
+references are removed from Cargo's environment.
+
+**GitHub App** (short-lived git tokens for GitHub and GitHub Enterprise
+Server). The agent signs an RS256 JWT with the App's private key, finds the
+installation with `GET /repos/{owner}/{repo}/installation` unless
+`installation_id` is set, and mints a token with
+`POST /app/installations/{id}/access_tokens` for that one repository and the
+given `permissions`. The username is `x-access-token`; the expiry comes from
+the response.
+
+```toml
+[[credentials]]
+name = "acme-github"
+match = { kind = "git", host = "github.com", path = "acme/*" }
+provider = "github-app"
+app_id = 123456
+private_key = { file = "/run/secrets/gh-app.pem" }   # PKCS#1 or PKCS#8 PEM
+# installation_id = 789                # optional; otherwise looked up per repository
+# api_url = "https://ghe.acme.dev/api/v3"   # GitHub Enterprise Server
+permissions = { contents = "read" }
+allow_tokens = ["*"]
+```
+
+**GitLab.** Either forward from your machine (OAuth through `glab` or Git
+Credential Manager) with `[forward]` and, for example,
+`[[forward.command]]` running `glab auth token`; or put a deploy token on
+the agent with a `file` provider:
+
+```toml
+[[credentials]]
+name = "gitlab-deploy"
+match = { kind = "git", host = "gitlab.acme.dev" }
+provider = "file"
+path = "/run/secrets/gitlab-deploy-token"
+username = "deploy-bot"
+allow_tokens = ["ci", "alice"]
+```
+
+**Vault, cloud secret managers, anything else**: `exec` runs a command
+(no shell, killed after `timeout` seconds, default 30) with the request as
+JSON on stdin (`kind`, the scope fields, `token_name`, `phase`) and expects
+`{"secret": ..., "username": ..., "expires_at": ...}` on stdout (`username`
+and `expires_at` optional). Its stderr goes to the agent log.
+
+```toml
+[[credentials]]
+name = "acme-registry"
+match = { kind = "cargo", registry = "acme" }
+provider = "exec"
+command = ["/usr/local/bin/registry-token"]
+allow_tokens = ["*"]
+
+[[credentials]]
+name = "ghcr"
+match = { kind = "docker", host = "ghcr.io" }
+provider = "env"
+var = "GHCR_TOKEN"
+username = "ci-bot"
+allow_tokens = ["*"]
+phases = ["build"]           # only useful with a client rule that opts ghcr.io into build
+```
+
+**Per-token policy.** `allow_client = false` makes the agent never ask the
+client for builds of that token (e.g. CI tokens, whose "client" is not a
+developer machine):
+
+```toml
+[tokens.ci]
+allow_client = false
+```
+
+### Audit log
+
+Every credential decision is appended as a JSON line to
+`<data_dir>/audit.log` (mode 0600) and logged as one line on the agent's
+stderr: `ts`, `token`, `workspace`, `kind`, `scope`, `phase`, `source`
+(`agent:<name>` or `client`; `none` when denied), `outcome` (`served`,
+`cached` or `denied`), `expires_at`, and `chain` (the reasons) for denials.
+Secrets never appear in it.
+
+### `cargo live creds explain`
+
+A dry run of the resolution, from the workspace: nothing is minted and no
+resolver runs.
+
+```sh
+cargo live creds explain git https://github.com/acme/foo.git   # or host/path, git@host:path
+cargo live creds explain cargo acme                            # registry name or index URL
+cargo live creds explain docker ghcr.io
+```
+
+```
+credentials for git github.com/acme/foo (agent build-host:2222)
+  rule                user rule #1 (match kind=git host=github.com path=acme/*): sources = ["agent"], phases = ["fetch"]
+  fetch phase: agent  [allowed] would use provider "acme-github" (github-app)
+  build phase         [not allowed] phase build is not in phases
+  this machine        not in [forward]: this machine refuses to forward it
+```
+
+The rule line says where the rule came from (`user`, `project` or
+`default`).
+
+### Limits of the model
+
+- Builds run as the agent's OS user. Root secrets mounted into the agent
+  (files, the agent's own environment) are readable by build scripts of any
+  token. Phase gating protects what the broker hands out, not what the
+  agent can read; prefer short-lived, narrowly scoped credentials
+  (GitHub App tokens limited to one repository and `contents: read`) and
+  run one agent per trust domain.
+- Cargo's git and registry caches (`$CARGO_HOME/git`, `/registry`) are
+  shared by all tokens of an agent: once one token fetched a private
+  dependency, other tokens can build it from the cache without credentials.
+
 ## Security model
 
 - **Transport:** SSH, implemented by russh on both ends with its default
@@ -345,7 +643,8 @@ preparation is **not** redirected and still runs locally.
   who trust each other, and run one agent (container, with its own volume)
   per user or trust domain.
 - Do not sync secrets: everything in the workspace except excluded paths is
-  copied to the build host.
+  copied to the build host. For credentials builds need, see
+  [Credentials](#credentials).
 
 ## Compatibility
 
@@ -364,7 +663,8 @@ versions of both.
 
 This is an early prototype, not a complete replacement for Cargo:
 
-- Supported commands: `run` and `check` (plus `login`/`logout`). `build`,
+- Supported commands: `run` and `check` (plus `login`/`logout` and
+  `creds explain`). `build`,
   `test`, `bench` and others are not forwarded.
 - `--target-dir` and `--manifest-path` are refused. For `run`,
   `--message-format` is refused, and cross-compilation (`--target`,
@@ -382,6 +682,6 @@ This is an early prototype, not a complete replacement for Cargo:
 - Workspaces are identified by token and local path: two machines using the
   same token and the same workspace path share one remote workspace (and its
   lock).
-- Private registries and git dependencies need credentials on the agent;
-  path dependencies outside the workspace are not synced. Interactive builds
-  are not supported (Cargo's stdin is closed).
+- Path dependencies outside the workspace are not synced. Interactive builds
+  are not supported (Cargo's stdin is closed). Credentials for private
+  dependencies are brokered per job, see [Credentials](#credentials).
