@@ -3,6 +3,7 @@ mod hostkey;
 mod job;
 mod log;
 mod mirror;
+mod net;
 mod runner;
 mod server;
 mod session;
@@ -123,6 +124,15 @@ async fn serve(settings: settings::Settings) -> Result<()> {
         settings.paths.data_dir.display(),
         settings.max_concurrent_builds,
         settings.max_connections
+    );
+    log!(
+        "build proxy direct connections: {}",
+        if settings.network_direct.is_empty() {
+            "none".to_owned()
+        } else {
+            let direct: Vec<&str> = settings.network_direct.iter().map(|p| p.as_str()).collect();
+            direct.join(", ")
+        }
     );
     let config = server::ssh_config(key);
     let shared = Arc::new(server::Shared::new(settings, agent_exe));

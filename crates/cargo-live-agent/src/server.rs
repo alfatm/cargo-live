@@ -9,6 +9,9 @@
 //!   which accepts only an exec or subsystem request named [`CHANNEL_NAME`];
 //!   pty, shell, env, x11, agent forwarding, signals, TCP/IP and streamlocal
 //!   forwarding and every other channel type are refused;
+//! - the agent itself opens `forwarded-tcpip` channels towards the client
+//!   for the build proxy's `client` tunnels (see `net`); the client accepts
+//!   them only during a build and only for destinations in its `[tunnel]`;
 //! - unauthenticated connections are closed after [`AUTH_DEADLINE`];
 //! - at most `max_connections` connections (authenticated or not) are open
 //!   at once; further connections are closed right after `accept`.
@@ -412,7 +415,16 @@ impl Connection {
         session.channel_success(channel)?;
         let shared = self.shared.clone();
         let peer = self.peer;
-        tokio::spawn(crate::session::run(shared, token, peer, ch.into_stream()));
+        // The handle opens `forwarded-tcpip` channels to the client for
+        // the build proxy's tunnels.
+        let handle = session.handle();
+        tokio::spawn(crate::session::run(
+            shared,
+            token,
+            peer,
+            ch.into_stream(),
+            handle,
+        ));
         Ok(())
     }
 }

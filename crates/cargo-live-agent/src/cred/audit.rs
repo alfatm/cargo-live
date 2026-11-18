@@ -1,5 +1,6 @@
-//! `<data_dir>/audit.log`: one JSON line per credential decision (0600).
-//! Entries never contain secrets.
+//! `<data_dir>/audit.log`: one JSON line per credential decision and per
+//! proxied network connection (0600). Entries never contain secrets or
+//! payloads.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -50,6 +51,56 @@ pub fn record(path: &Path, entry: &Entry<'_>) {
         entry.source,
         entry.outcome
     );
+    append(path, entry);
+}
+
+/// One proxied connection (`kind = "network"`), written when it closes or
+/// is refused.
+#[derive(Debug, Serialize)]
+pub struct NetEntry<'a> {
+    pub ts: String,
+    pub token: &'a str,
+    pub workspace: &'a str,
+    /// Always `network`.
+    pub kind: &'static str,
+    pub host: &'a str,
+    pub port: u16,
+    pub phase: String,
+    /// `agent` (direct), `client` (tunnel) or `none` (refused).
+    pub via: &'a str,
+    /// `closed`, `idle-timeout`, `error`, `step-ended` (still open when
+    /// the build step ended, e.g. a keep-alive connection) or `denied`.
+    pub outcome: &'a str,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub chain: Vec<String>,
+}
+
+pub fn record_net(path: &Path, entry: &NetEntry<'_>) {
+    let chain = if entry.chain.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", entry.chain.join("; "))
+    };
+    log!(
+        "network: token={} workspace={} {} phase={} via={} outcome={} up={} down={}{chain}",
+        entry.token,
+        short(entry.workspace),
+        cargo_live_proto::net::Destination {
+            host: entry.host.to_owned(),
+            port: entry.port
+        },
+        entry.phase,
+        entry.via,
+        entry.outcome,
+        entry.bytes_up,
+        entry.bytes_down
+    );
+    append(path, entry);
+}
+
+fn append(path: &Path, entry: &impl Serialize) {
     let Ok(mut line) = serde_json::to_string(entry) else {
         return;
     };

@@ -60,6 +60,10 @@ pub struct TokenPolicy {
     /// Whether builds of this token may ask the client for credentials.
     #[serde(default = "yes")]
     pub allow_client: bool,
+    /// Whether builds of this token may tunnel network connections
+    /// through the client.
+    #[serde(default = "yes")]
+    pub allow_tunnel: bool,
 }
 
 fn yes() -> bool {
@@ -68,7 +72,10 @@ fn yes() -> bool {
 
 impl Default for TokenPolicy {
     fn default() -> Self {
-        Self { allow_client: true }
+        Self {
+            allow_client: true,
+            allow_tunnel: true,
+        }
     }
 }
 
@@ -407,6 +414,7 @@ allow_tokens = ["dreo"]
 
 [tokens.ci]
 allow_client = false
+allow_tunnel = false
 "#,
         )
         .unwrap();
@@ -426,6 +434,8 @@ allow_client = false
         assert!(creds.providers[1].allows_phase(Phase::Build));
         assert!(!creds.token_policy("ci").allow_client);
         assert!(creds.token_policy("dreo").allow_client);
+        assert!(!creds.token_policy("ci").allow_tunnel);
+        assert!(creds.token_policy("dreo").allow_tunnel);
         assert_eq!(creds.secret_env_vars(), ["GHCR_TOKEN"]);
     }
 

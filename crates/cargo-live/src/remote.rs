@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 
 use cargo_live_proto::cred::{Credential, CredentialPolicy, ExplainStep, Scope};
+use cargo_live_proto::net::{Destination, NetworkPolicy};
 use cargo_live_proto::{
     parse_version, write_frame, AgentMsg, BuildRequest, ClientMsg, Entry, FrameReader, SyncStats,
     WaitReason, Welcome, CHUNK_SIZE, PROTOCOL_VERSION,
@@ -18,6 +19,7 @@ use cargo_live_proto::{
 
 use crate::config::AgentUrl;
 use crate::creds::resolve::ClientResolver;
+use crate::net::TunnelGate;
 use crate::output::{handle_line, Emit};
 use crate::ssh::{self, Verifier};
 use crate::store::CachedBinary;
@@ -25,6 +27,7 @@ use crate::{error, Result};
 
 pub struct Remote {
     handle: client::Handle<Verifier>,
+    tunnel: Option<Arc<TunnelGate>>,
     rd: FrameReader<ReadHalf<ChannelStream<client::Msg>>>,
     wr: WriteHalf<ChannelStream<client::Msg>>,
 }
@@ -40,11 +43,13 @@ impl Remote {
         url: &AgentUrl,
         pin: Option<&str>,
         token: &str,
+        tunnel: Option<Arc<TunnelGate>>,
     ) -> Result<(Self, Welcome)> {
-        let conn = ssh::connect(url, pin, token).await?;
+        let conn = ssh::connect(url, pin, token, tunnel.clone()).await?;
         let (rd, wr) = tokio::io::split(conn.stream);
         let mut remote = Self {
             handle: conn.handle,
+            tunnel,
             rd: FrameReader::new(rd),
             wr,
         };
@@ -91,8 +96,22 @@ impl Remote {
     }
 
     /// Sends the credential policy (rules, `[forward]`, registries).
-    pub async fn send_policy(&mut self, policy: CredentialPolicy) -> Result<()> {
+    pub async fn send_credential_policy(&mut self, policy: CredentialPolicy) -> Result<()> {
         self.send(&ClientMsg::CredentialPolicy(policy)).await
+    }
+
+    /// Sends the network policy (`[tunnel]`, `[[network]]`).
+    pub async fn send_network_policy(&mut self, network: NetworkPolicy) -> Result<()> {
+        self.send(&ClientMsg::NetworkPolicy(network)).await
+    }
+
+    /// Dry run of the agent's network decision for `destination`.
+    pub async fn net_explain(&mut self, destination: Destination) -> Result<Vec<ExplainStep>> {
+        self.send(&ClientMsg::NetExplain { destination }).await?;
+        match self.recv().await? {
+            AgentMsg::ExplainResult { steps } => Ok(steps),
+            other => Err(unexpected(&other)),
+        }
     }
 
     /// Dry run of the agent's credential resolution for `scope`.
@@ -178,6 +197,8 @@ impl Remote {
         resolver: Arc<ClientResolver>,
     ) -> Result<BuildResult> {
         let json_output = request.json_output;
+        // The agent may open tunnel channels only while the build runs.
+        let _tunnels = self.tunnel.clone().map(TunnelsOpen::new);
         self.send(&ClientMsg::Build(request)).await?;
         let (answers_tx, mut answers) = mpsc::channel::<(u64, Result<Credential, String>)>(8);
         let one_at_a_time = Arc::new(std::sync::Mutex::new(()));
@@ -205,6 +226,9 @@ impl Remote {
                 }
                 AgentMsg::CredentialEvent(event) => {
                     eprintln!("{}", crate::creds::event_line(&event));
+                }
+                AgentMsg::NetEvent(event) => {
+                    eprintln!("{}", crate::net::event_line(&event));
                 }
                 AgentMsg::Stdout(line) => match handle_line(&line, json_output, remotes, local) {
                     Emit::Stdout(text) => {
@@ -302,6 +326,22 @@ impl Remote {
     }
 }
 
+/// Allows tunnel channels until dropped.
+struct TunnelsOpen(Arc<TunnelGate>);
+
+impl TunnelsOpen {
+    fn new(gate: Arc<TunnelGate>) -> Self {
+        gate.activate();
+        Self(gate)
+    }
+}
+
+impl Drop for TunnelsOpen {
+    fn drop(&mut self) {
+        self.0.deactivate();
+    }
+}
+
 fn received(
     frame: std::result::Result<Option<AgentMsg>, cargo_live_proto::FrameError>,
 ) -> Result<AgentMsg> {
@@ -333,6 +373,7 @@ fn unexpected(msg: &AgentMsg) -> Box<dyn std::error::Error + Send + Sync> {
         AgentMsg::CredentialRequest { .. } => "CredentialRequest",
         AgentMsg::CredentialEvent(_) => "CredentialEvent",
         AgentMsg::ExplainResult { .. } => "ExplainResult",
+        AgentMsg::NetEvent(_) => "NetEvent",
     };
     error(format!("protocol error: unexpected {name} from the agent")).into()
 }

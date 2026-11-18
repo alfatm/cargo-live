@@ -9,3 +9,6 @@ compose.yaml
 .claude/
 **/*.log
 **/*.swp
+compose.netbird.yaml
+demo/
+netbird-setup-key

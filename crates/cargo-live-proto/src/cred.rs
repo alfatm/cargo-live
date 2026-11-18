@@ -352,7 +352,7 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     p[pi..].iter().all(|c| *c == '*')
 }
 
-fn literal_len(pattern: &str) -> usize {
+pub(crate) fn literal_len(pattern: &str) -> usize {
     pattern.chars().filter(|c| *c != '*' && *c != '?').count()
 }
 

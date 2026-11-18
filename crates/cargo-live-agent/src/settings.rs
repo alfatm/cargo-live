@@ -17,6 +17,7 @@ use serde::Deserialize;
 use crate::cred::config::{ProviderConfig, TokenPolicy};
 use crate::cred::AgentCreds;
 use crate::Result;
+use cargo_live_proto::net::{parse_patterns, HostPattern};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -96,6 +97,11 @@ pub struct ServeArgs {
     /// connections are closed immediately [default: 64]
     #[arg(long, env = "CARGO_LIVE_AGENT_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
+    /// Destinations (`host[:port]` globs, any port when omitted) the build
+    /// proxy may connect to directly from the agent; repeat the flag or
+    /// separate with commas, "" for none [default: *]
+    #[arg(long, env = "CARGO_LIVE_AGENT_NETWORK_DIRECT", value_delimiter = ',')]
+    pub network_direct: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -115,9 +121,20 @@ struct FileConfig {
     /// Per-token credential policy (`[tokens.<name>]`).
     #[serde(default)]
     tokens: BTreeMap<String, TokenPolicy>,
+    /// Build proxy policy (`[network]`).
+    #[serde(default)]
+    network: NetworkConfig,
     /// Directory of the config file, for relative paths.
     #[serde(skip)]
     base: PathBuf,
+}
+
+/// `[network]` in agent.toml.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkConfig {
+    /// `host[:port]` globs the proxy may connect to directly.
+    direct: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +153,9 @@ pub struct Settings {
     pub lock_timeout: Duration,
     pub max_connections: usize,
     pub creds: Arc<AgentCreds>,
+    /// `[network] direct`: destinations the build proxy may connect to
+    /// from the agent itself (empty: none), parsed.
+    pub network_direct: Arc<Vec<HostPattern>>,
 }
 
 const DEFAULT_DATA_DIR: &str = "/data";
@@ -222,7 +242,19 @@ pub fn settings(args: &ServeArgs) -> Result<Settings> {
         std::mem::take(&mut file.tokens),
         &file.base,
     )?;
+    // An empty value (`--network-direct ""`) means no direct connections.
+    let network_direct: Vec<String> = args
+        .network_direct
+        .clone()
+        .or(file.network.direct.take())
+        .unwrap_or_else(|| vec!["*".to_owned()])
+        .into_iter()
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let network_direct = parse_patterns(&network_direct, None, "network direct")?;
     let settings = Settings {
+        network_direct: Arc::new(network_direct),
         creds: Arc::new(creds),
         paths,
         listen: args
@@ -286,6 +318,25 @@ mod tests {
         args.max_connections = Some(0);
         assert!(settings(&args).is_err());
         args.max_connections = None;
+        let direct = |s: &Settings| -> Vec<String> {
+            s.network_direct.iter().map(|p| p.to_string()).collect()
+        };
+        assert_eq!(direct(&s), ["*"]);
+
+        fs::write(
+            dir.path().join("agent.toml"),
+            "[network]\ndirect = ['*.internal', '10.0.0.1:443']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            direct(&settings(&args).unwrap()),
+            ["*.internal", "10.0.0.1:443"]
+        );
+        args.network_direct = Some(vec![String::new()]);
+        assert!(settings(&args).unwrap().network_direct.is_empty());
+        args.network_direct = Some(vec!["h:0".into()]);
+        assert!(settings(&args).is_err());
+        args.network_direct = None;
 
         args.common.config = Some(dir.path().join("missing.toml"));
         assert!(settings(&args).is_err());

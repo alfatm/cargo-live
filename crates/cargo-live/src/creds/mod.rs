@@ -26,6 +26,12 @@ pub struct UserConfig {
     pub forward: Forward,
     #[serde(default)]
     pub credentials: Vec<Rule>,
+    /// `[tunnel]`: destinations this machine connects to for the agent.
+    #[serde(default)]
+    pub tunnel: crate::net::Tunnel,
+    /// `[[network]]`: which route to use per destination.
+    #[serde(default)]
+    pub network: Vec<cargo_live_proto::net::NetRule>,
 }
 
 /// `[forward]`: what this machine may hand out, and how.
@@ -112,6 +118,9 @@ impl UserConfig {
     pub fn parse(text: &str) -> Result<Self> {
         let config: Self = toml::from_str(text)?;
         for rule in &config.credentials {
+            rule.validate().map_err(error)?;
+        }
+        for rule in &config.network {
             rule.validate().map_err(error)?;
         }
         for command in &config.forward.command {
@@ -241,9 +250,22 @@ sources = ["client"]
 match = { kind = "cargo", registry = "acme" }
 sources = ["agent", "client"]
 phases = ["fetch"]
+
+[tunnel]
+hosts = ["gitlab.volka.com:443", "crates.volka.com"]
+
+[[network]]
+match = { host = "gitlab.volka.com" }
+via = ["agent", "client"]
+[[network]]
+match = { host = "*.internal", port = 8443 }
+via = ["client"]
+phases = ["fetch", "build"]
 "#,
         )
         .unwrap();
+        assert_eq!(config.tunnel.hosts.len(), 2);
+        assert_eq!(config.network.len(), 2);
         assert_eq!(config.credentials.len(), 3);
         assert_eq!(config.forward.command[0].command, ["glab", "auth", "token"]);
         assert!(!config.forward.interactive);
@@ -271,6 +293,11 @@ phases = ["fetch"]
             "[[credentials]]\nmatch = { kind = 'git', registry = 'x' }\nsources = ['agent']\n",
             "[forward]\nunknown = 1\n",
             "[[forward.command]]\nmatch = { kind = 'git' }\ncommand = []\n",
+            "[tunnel]\nhosts = ['h:0']\n",
+            "[tunnel]\nunknown = 1\n",
+            "[[network]]\nmatch = { host = 'h' }\nvia = []\n",
+            "[[network]]\nmatch = { host = 'h:443' }\nvia = ['client']\n",
+            "[[network]]\nmatch = { host = 'h', path = 'x' }\nvia = ['client']\n",
         ] {
             assert!(UserConfig::parse(bad).is_err(), "{bad}");
         }

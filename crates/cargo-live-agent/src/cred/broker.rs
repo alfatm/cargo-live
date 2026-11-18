@@ -123,11 +123,12 @@ impl Broker {
 
     /// Adds the broker environment to `cmd` and returns the Cargo
     /// `--config` arguments that register the credential provider.
+    /// git configuration entries go through [`git_credential_entries`] and
+    /// [`git_config_env`], so that the proxy can add its own.
     pub fn configure(
         &self,
         cmd: &mut Command,
         agent_exe: &Path,
-        git_hosts: &[String],
         registry_names: &[String],
     ) -> Result<Vec<String>> {
         let exe = agent_exe
@@ -142,9 +143,6 @@ impl Broker {
         let mut paths = vec![self.dir.join("bin")];
         paths.extend(std::env::split_paths(&path));
         cmd.env("PATH", std::env::join_paths(paths)?);
-        for (k, v) in git_config_env(exe, git_hosts, std::env::var("GIT_CONFIG_COUNT").ok()) {
-            cmd.env(k, v);
-        }
         let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
         let args = vec![
             "--config".into(),
@@ -276,11 +274,10 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// `GIT_CONFIG_*` entries: clear inherited credential helpers, use the
-/// agent as the only helper, match credentials per repository path, and
-/// rewrite SSH URLs of `hosts` to HTTPS. Existing entries (`count`) are
-/// kept; ours are appended after them.
-pub fn git_config_env(exe: &str, hosts: &[String], count: Option<String>) -> Vec<(String, String)> {
+/// git configuration of a broker: clear inherited credential helpers, use
+/// the agent as the only helper, match credentials per repository path,
+/// and rewrite SSH URLs of `hosts` to HTTPS.
+pub fn git_credential_entries(exe: &str, hosts: &[String]) -> Vec<(String, String)> {
     let mut entries = vec![
         ("credential.helper".to_owned(), String::new()),
         (
@@ -294,6 +291,15 @@ pub fn git_config_env(exe: &str, hosts: &[String], count: Option<String>) -> Vec
         entries.push((key.clone(), format!("git@{host}:")));
         entries.push((key, format!("ssh://git@{host}/")));
     }
+    entries
+}
+
+/// `GIT_CONFIG_*` variables for `entries`. Existing entries (`count`) are
+/// kept; ours are appended after them.
+pub fn git_config_env(
+    entries: &[(String, String)],
+    count: Option<String>,
+) -> Vec<(String, String)> {
     let base: usize = count.and_then(|c| c.trim().parse().ok()).unwrap_or(0);
     let mut env = Vec::new();
     for (i, (k, v)) in entries.iter().enumerate() {
@@ -519,11 +525,12 @@ mod tests {
 
     #[test]
     fn git_config_appends_after_existing_entries() {
-        let env = git_config_env(
+        let mut entries = git_credential_entries(
             "/opt/my agent/cargo-live-agent",
             &["github.com".into(), "gitlab.acme.dev".into()],
-            Some("2".into()),
         );
+        entries.push(("http.proxy".into(), "http://p".into()));
+        let env = git_config_env(&entries, Some("2".into()));
         let get = |k: &str| {
             env.iter()
                 .find(|(key, _)| key == k)
@@ -546,7 +553,8 @@ mod tests {
             get("GIT_CONFIG_VALUE_8"),
             Some("ssh://git@gitlab.acme.dev/")
         );
-        assert_eq!(get("GIT_CONFIG_COUNT"), Some("9"));
+        assert_eq!(get("GIT_CONFIG_KEY_9"), Some("http.proxy"));
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("10"));
         assert!(get("GIT_CONFIG_KEY_0").is_none());
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }

@@ -1,5 +1,6 @@
 mod config;
 mod creds;
+mod net;
 mod output;
 mod remote;
 mod ssh;
@@ -18,6 +19,7 @@ use serde::Deserialize;
 use cargo_live_proto::{sha256_hex, BuildCommand, BuildRequest, BUILD_TARGET, TOKEN_PREFIX};
 
 use cargo_live_proto::cred::{parse_git_target, CredentialPolicy, Scope};
+use cargo_live_proto::net::{Destination, NetworkPolicy, DEFAULT_TUNNEL_PORT};
 use config::{AgentUrl, Config};
 use creds::registries::LocalCargoConfig;
 use creds::resolve::ClientResolver;
@@ -97,8 +99,11 @@ fn main_impl() -> Result<i32> {
         Some("login") => return login(&cwd, &args),
         Some("logout") => return logout(&args),
         Some("creds") => return creds_command(&cwd, &args),
+        Some("net") => return net_command(&cwd, &args),
         _ => {
-            return Err(error("supported commands: run, check, login, logout, creds, help").into())
+            return Err(
+                error("supported commands: run, check, login, logout, creds, net, help").into(),
+            )
         }
     }
     let is_run = command == "run";
@@ -122,13 +127,7 @@ fn main_impl() -> Result<i32> {
     let (cargo_args, program_args) = split_args(args, is_run)?;
 
     let url = config.url()?;
-    let token = Credentials::default_location()?
-        .lookup(&url.to_string())?
-        .ok_or_else(|| {
-            error(format!(
-                "no token for {url}; run `cargo live login {url}` or set CARGO_LIVE_TOKEN"
-            ))
-        })?;
+    let token = lookup_token(&url)?;
     let user_config = UserConfig::load()?;
     let local_cargo = LocalCargoConfig::load(&workspace);
     let policy = creds::policy(
@@ -136,10 +135,14 @@ fn main_impl() -> Result<i32> {
         &config.credentials,
         local_cargo.registries_config(),
     );
+    let network = net::policy(&user_config.tunnel, &user_config.network, &config.network);
+    let tunnel = net::TunnelGate::new(user_config.tunnel.patterns().to_vec());
     let resolver = Arc::new(ClientResolver::new(user_config.forward, local_cargo));
     let job = Job {
         url,
         policy,
+        network,
+        tunnel,
         resolver,
         pin: config.remote.host_key.clone(),
         token,
@@ -215,6 +218,8 @@ fn local_env(
 struct Job {
     url: AgentUrl,
     policy: CredentialPolicy,
+    network: NetworkPolicy,
+    tunnel: Arc<net::TunnelGate>,
     resolver: Arc<ClientResolver>,
     pin: Option<String>,
     token: String,
@@ -236,8 +241,13 @@ enum Outcome {
 impl Job {
     async fn run(self) -> Result<Outcome> {
         let is_run = self.request.command == BuildCommand::Run;
-        let (mut remote, welcome) =
-            Remote::connect(&self.url, self.pin.as_deref(), &self.token).await?;
+        let (mut remote, welcome) = Remote::connect(
+            &self.url,
+            self.pin.as_deref(),
+            &self.token,
+            Some(self.tunnel.clone()),
+        )
+        .await?;
         if is_run {
             match remote::compat_check(&welcome, BUILD_TARGET, remote::local_glibc().as_deref()) {
                 Ok(None) => {}
@@ -256,7 +266,8 @@ impl Job {
         }
         let workspace_id = sha256_hex(self.workspace.as_os_str().as_encoded_bytes());
         let (source, physical) = remote.open(&workspace_id).await?;
-        remote.send_policy(self.policy.clone()).await?;
+        remote.send_credential_policy(self.policy.clone()).await?;
+        remote.send_network_policy(self.network.clone()).await?;
 
         let (root, target, excludes) = (
             self.workspace.clone(),
@@ -326,7 +337,7 @@ fn login(cwd: &Path, args: &[OsString]) -> Result<i32> {
         .enable_all()
         .build()?;
     let welcome = runtime.block_on(async {
-        let (remote, welcome) = Remote::connect(&url, pin.as_deref(), &token).await?;
+        let (remote, welcome) = Remote::connect(&url, pin.as_deref(), &token, None).await?;
         remote.close().await;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(welcome)
     })?;
@@ -373,6 +384,64 @@ fn logout(args: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
+/// What the explain commands need: the workspace, its config, the agent
+/// and its token, and the user config.
+struct ExplainContext {
+    workspace: PathBuf,
+    config: Config,
+    url: AgentUrl,
+    token: String,
+    user: UserConfig,
+}
+
+impl ExplainContext {
+    fn load(cwd: &Path) -> Result<Self> {
+        let (root, config) = Config::find(cwd)?.ok_or_else(|| {
+            error("no .cargo/live.toml found in the current directory or its parents")
+        })?;
+        let url = config.url()?;
+        Ok(Self {
+            workspace: root.canonicalize()?,
+            token: lookup_token(&url)?,
+            url,
+            config,
+            user: UserConfig::load()?,
+        })
+    }
+
+    /// Connects to the agent, runs `f` on the session (a dry run: no
+    /// workspace is opened) and closes it.
+    fn session<T>(&self, f: impl AsyncFnOnce(&mut Remote) -> Result<T>) -> Result<T> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (mut remote, _) = Remote::connect(
+                &self.url,
+                self.config.remote.host_key.as_deref(),
+                &self.token,
+                None,
+            )
+            .await?;
+            let result = f(&mut remote).await;
+            remote.close().await;
+            result
+        })
+    }
+}
+
+/// The token for `url` (stored by `cargo live login`, or `CARGO_LIVE_TOKEN`).
+fn lookup_token(url: &AgentUrl) -> Result<String> {
+    Credentials::default_location()?
+        .lookup(&url.to_string())?
+        .ok_or_else(|| {
+            error(format!(
+                "no token for {url}; run `cargo live login {url}` or set CARGO_LIVE_TOKEN"
+            ))
+            .into()
+        })
+}
+
 /// `cargo live creds explain <git|cargo|docker> <target>`
 fn creds_command(cwd: &Path, args: &[OsString]) -> Result<i32> {
     const USAGE: &str = "usage: cargo live creds explain git <url-or-host/path>\n       \
@@ -382,11 +451,8 @@ fn creds_command(cwd: &Path, args: &[OsString]) -> Result<i32> {
     let ["explain", kind, target] = args[..] else {
         return Err(error(USAGE).into());
     };
-    let (root, config) = Config::find(cwd)?.ok_or_else(|| {
-        error("no .cargo/live.toml found in the current directory or its parents")
-    })?;
-    let workspace = root.canonicalize()?;
-    let local_cargo = LocalCargoConfig::load(&workspace);
+    let ctx = ExplainContext::load(cwd)?;
+    let local_cargo = LocalCargoConfig::load(&ctx.workspace);
     let scope = match kind {
         "git" => parse_git_target(target).map_err(error)?,
         "cargo" if target.contains("://") => Scope::cargo(None, Some(target)),
@@ -395,35 +461,40 @@ fn creds_command(cwd: &Path, args: &[OsString]) -> Result<i32> {
         _ => return Err(error(USAGE).into()),
     };
     scope.validate().map_err(error)?;
-    let url = config.url()?;
-    let token = Credentials::default_location()?
-        .lookup(&url.to_string())?
-        .ok_or_else(|| {
-            error(format!(
-                "no token for {url}; run `cargo live login {url}` or set CARGO_LIVE_TOKEN"
-            ))
-        })?;
-    let user_config = UserConfig::load()?;
     let policy = creds::policy(
-        &user_config,
-        &config.credentials,
+        &ctx.user,
+        &ctx.config.credentials,
         local_cargo.registries_config(),
     );
-    let resolver = ClientResolver::new(user_config.forward, local_cargo);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let steps = runtime.block_on(async {
-        let (mut remote, _) =
-            Remote::connect(&url, config.remote.host_key.as_deref(), &token).await?;
-        remote.send_policy(policy).await?;
-        let steps = remote.explain(scope.clone()).await;
-        remote.close().await;
-        steps
+    let steps = ctx.session(async |remote| {
+        remote.send_credential_policy(policy).await?;
+        remote.explain(scope.clone()).await
+    })?;
+    let resolver = ClientResolver::new(ctx.user.forward.clone(), local_cargo);
+    print!(
+        "{}",
+        creds::explain_text(&scope, &ctx.url.to_string(), &steps, &resolver)
+    );
+    Ok(0)
+}
+
+/// `cargo live net explain <host[:port]>`
+fn net_command(cwd: &Path, args: &[OsString]) -> Result<i32> {
+    const USAGE: &str = "usage: cargo live net explain <host[:port]>   (port defaults to 443)";
+    let args: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
+    let ["explain", target] = args[..] else {
+        return Err(error(USAGE).into());
+    };
+    let destination = Destination::parse(target, Some(DEFAULT_TUNNEL_PORT)).map_err(error)?;
+    let ctx = ExplainContext::load(cwd)?;
+    let network = net::policy(&ctx.user.tunnel, &ctx.user.network, &ctx.config.network);
+    let steps = ctx.session(async |remote| {
+        remote.send_network_policy(network).await?;
+        remote.net_explain(destination.clone()).await
     })?;
     print!(
         "{}",
-        creds::explain_text(&scope, &url.to_string(), &steps, &resolver)
+        net::explain_text(&destination, &ctx.url.to_string(), &steps, &ctx.user.tunnel)
     );
     Ok(0)
 }
@@ -435,7 +506,8 @@ fn print_help() {
          cargo live check [CARGO OPTIONS]\n  \
          cargo live login <host[:port]>   (reads the token from stdin)\n  \
          cargo live logout <host[:port]>\n  \
-         cargo live creds explain <git|cargo|docker> <target>\n\n\
+         cargo live creds explain <git|cargo|docker> <target>\n  \
+         cargo live net explain <host[:port]>\n\n\
          Configure .cargo/live.toml at the workspace root. See the README for\n\
          the agent setup, VS Code integration, and the optional cargo PATH shim.",
         env!("CARGO_PKG_VERSION")

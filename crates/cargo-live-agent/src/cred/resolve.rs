@@ -43,6 +43,8 @@ pub enum ToClient {
         reply: oneshot::Sender<Result<Credential, String>>,
     },
     Event(CredEvent),
+    /// A network decision of the build proxy.
+    Net(cargo_live_proto::net::NetEvent),
 }
 
 pub struct CredSession {
@@ -504,6 +506,7 @@ mod tests {
             "ci".to_owned(),
             TokenPolicy {
                 allow_client: false,
+                allow_tunnel: true,
             },
         );
         if !allow_client {
@@ -511,6 +514,7 @@ mod tests {
                 token.to_owned(),
                 TokenPolicy {
                     allow_client: false,
+                    allow_tunnel: true,
                 },
             );
         }
@@ -560,6 +564,7 @@ mod tests {
                         });
                     }
                     ToClient::Event(e) => seen.lock().unwrap().push(e),
+                    ToClient::Net(_) => {}
                 }
             }
         });

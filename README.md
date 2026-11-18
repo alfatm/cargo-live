@@ -36,9 +36,10 @@ One build is one SSH connection:
 4. Incremental sync: the client sends a listing (paths, sizes, mtimes,
    modes, symlinks); the agent asks only for changed files and deletes files
    that disappeared locally.
-5. The agent runs `cargo fetch` (with the credential broker open, see
-   [Credentials](#credentials)), then `cargo run` / `cargo check`, and
-   streams the output back.
+5. The agent runs `cargo fetch` (with the credential broker open, and the
+   build proxy if network rules need it, see [Credentials](#credentials) and
+   [Network access to private resources](#network-access-to-private-resources)),
+   then `cargo run` / `cargo check`, and streams the output back.
 6. For `run`, the agent records which executable Cargo would start (via a
    runner hook, so Cargo's own target selection, `default-run`, `--bin`,
    `--example` all apply). The client downloads it (skipped when the cached
@@ -125,6 +126,9 @@ docker compose exec agent cargo-live-agent token create --name alice
 docker compose exec agent cargo-live-agent fingerprint
 ```
 
+[`compose.netbird.yaml`](compose.netbird.yaml) runs the agent inside a
+NetBird network, see [Agent inside NetBird](#b-agent-inside-netbird-setup-key).
+
 ### Configuration
 
 Every option is resolved as flag > environment variable > config file >
@@ -141,6 +145,7 @@ default:
 | `--max-connections N` | `CARGO_LIVE_AGENT_MAX_CONNECTIONS` | `max_connections` | `64` |
 | `--lock-timeout SECS` | `CARGO_LIVE_AGENT_LOCK_TIMEOUT` | `lock_timeout` | `600` |
 | `--cargo PATH` | `CARGO_LIVE_AGENT_CARGO` | `cargo` | `cargo` from `PATH` |
+| `--network-direct GLOB,...` | `CARGO_LIVE_AGENT_NETWORK_DIRECT` | `[network] direct` | `["*"]` |
 
 - The first four apply to every subcommand (`serve`, `token`,
   `fingerprint`); the rest only to `serve`.
@@ -153,8 +158,10 @@ default:
   immediately and logged. `lock_timeout` is how long a build waits for a busy
   workspace before failing.
 
-`agent.toml` also holds credential providers (`[[credentials]]`) and
-per-token policies (`[tokens.<name>]`), see [Credentials](#credentials).
+`agent.toml` also holds credential providers (`[[credentials]]`),
+per-token policies (`[tokens.<name>]`), see [Credentials](#credentials),
+and the build proxy's `[network]` policy, see
+[Network access to private resources](#network-access-to-private-resources).
 
 Example `/data/agent.toml`:
 
@@ -195,7 +202,7 @@ cargo-live-agent fingerprint      # prints it (generates the key if missing)
 ```
 <data_dir>/host_key                   Ed25519 host key (0600)
 <data_dir>/tokens.toml                token names and hashes (0600)
-<data_dir>/audit.log                  credential decisions, JSON lines (0600)
+<data_dir>/audit.log                  credential and network decisions, JSON lines (0600)
 <data_dir>/workspaces/<token>/<workspace-id>/
     source/   mirror of the local workspace, managed by the agent
     target/   Cargo target directory, kept for incremental builds
@@ -594,10 +601,317 @@ The rule line says where the rule came from (`user`, `project` or
   token. Phase gating protects what the broker hands out, not what the
   agent can read; prefer short-lived, narrowly scoped credentials
   (GitHub App tokens limited to one repository and `contents: read`) and
-  run one agent per trust domain.
+  run one agent per trust domain (see [Security model](#security-model)
+  for tunnels).
 - Cargo's git and registry caches (`$CARGO_HOME/git`, `/registry`) are
   shared by all tokens of an agent: once one token fetched a private
   dependency, other tokens can build it from the cache without credentials.
+
+## Network access to private resources
+
+Some dependencies live on hosts that are only reachable through a VPN, for
+example an internal GitLab (`gitlab.example.com`) and registry
+(`crates.example.com`) behind NetBird. Often the VPN also provides DNS:
+those names resolve to internal addresses only through the VPN's resolver,
+while public DNS returns a different address (that answers 403, say) or
+nothing. A developer's VPN login is usually interactive (SSO), which a
+build agent cannot do. There are two approaches, and you can mix them per
+host:
+
+- **A. Tunnel through the client.** During `cargo fetch`, the agent's
+  build proxy routes connections to selected hosts through your machine,
+  which connects with its own VPN and DNS. Nothing to set up on the agent.
+  Good for personal agents and developers who are on the VPN anyway.
+- **B. Agent inside the VPN.** The agent's container joins the VPN
+  non-interactively, e.g. with a NetBird setup key
+  ([`compose.netbird.yaml`](compose.netbird.yaml)). Good for shared and CI
+  agents, builds without a developer machine connected, and build scripts
+  that need the private network.
+
+If a resource is merely IP-filtered rather than on a private network, a
+third option needs neither: allowlist the agent's egress IP at the
+resource's ingress (load balancer, firewall, the service's own IP
+restrictions) and let the agent connect directly. Look the egress IP up from
+inside the agent container, e.g. `docker exec <agent> curl -s
+https://ifconfig.me`; it must be stable (a static NAT or egress gateway).
+
+### A. Tunnel through the client
+
+The agent starts an HTTP proxy for `cargo fetch` when the session needs
+one: your user config has `[tunnel]` hosts or `[[network]]` rules, the
+project has `[[network]]` hints, or the agent's `[network] direct` is not
+the default `["*"]`. The build step gets one only if a rule opts in (see
+below). Without any of that, the steps' environment is left exactly as the
+agent's own (an agent behind a corporate proxy keeps using its
+`HTTPS_PROXY` and `NO_PROXY`). The proxy is:
+
+- bound to `127.0.0.1` on an ephemeral port, with a random per-step
+  password (`Proxy-Authorization: Basic`; other requests get `407`), and
+  closed with every connection when the step ends;
+- only for the step's own processes: on Linux each connection is traced
+  through `/proc` to the process that opened it, which must be the step's
+  Cargo or one of its descendants; anything else (or a connection that
+  cannot be traced) gets `407` and an audit entry, password or not;
+- passed to Cargo as `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`,
+  `http_proxy` and `CARGO_HTTP_PROXY` (a URL with the credentials), and to
+  git as `http.proxy` (plus `http.proxyAuthMethod = basic`) through the same
+  `GIT_CONFIG_*` mechanism the credential broker uses; `NO_PROXY`,
+  `no_proxy`, `ALL_PROXY` and `all_proxy` are removed, so all HTTP(S) of git
+  and Cargo goes through it, loopback included;
+- handling `CONNECT host:port` (HTTPS: TLS stays end to end, so git and
+  Cargo still send their credentials inside the tunnel and the proxy never
+  sees them) and absolute-form plain HTTP requests (`GET http://host/path`).
+  A plain request is rewritten to origin form with `Host` set to the URL's
+  authority and `Connection: close`, and forwarded with exactly its
+  `Content-Length` body (a `Transfer-Encoding` body gets `411`). One request
+  per connection: anything the client sends after it, such as a second
+  request on a keep-alive connection, is discarded; the connection closes
+  after the response.
+
+For each destination the proxy tries the sources of the matching rule in
+order:
+
+- **`agent`**: connect directly from the agent, if the agent's
+  `[network] direct` allows the destination; DNS lookup and TCP connect
+  within 5 s.
+- **`client`**: open a `forwarded-tcpip` channel over the build's existing
+  SSH connection. Your machine checks the destination against its
+  `[tunnel]` again, resolves it with the system resolver (so the VPN's DNS
+  applies), connects within 10 s, and relays bytes over that channel. SSH
+  provides flow control; tunnel data never goes through cargo-live's
+  framed control protocol.
+
+The first source that connects wins. The next one is tried only when a
+source is not allowed or its DNS lookup or TCP connect fails; if all fail,
+the proxy answers `502` and the build output shows the chain. Limits: at
+most 32 tunnels per connection at a time (enforced on both ends; further
+connections wait up to 30 s on the agent), 300 s idle timeout per
+connection; tunnels close when the step ends or the connection drops.
+
+**Fallback cannot see HTTP errors.** If `gitlab.example.com` resolves
+publicly to an address that answers 403, a direct attempt from the agent
+connects fine and the 403 arrives inside TLS, so there is no fallback. For
+hosts that are IP-filtered or have split DNS, use `via = ["client"]` (or an
+agent inside the VPN), not `["agent", "client"]`.
+
+#### Client configuration
+
+In `$XDG_CONFIG_HOME/cargo-live/config.toml`, next to `[forward]`:
+
+```toml
+[tunnel]                          # allowlist: what this machine connects to for the agent
+hosts = ["gitlab.example.com:443", "crates.example.com"]   # host[:port] globs, port defaults to 443 ("*": any)
+
+[[network]]
+match = { host = "gitlab.example.com" }   # host glob without a port ("[fd00::1]" for IPv6); optional port = 443
+via = ["client"]                          # order; fallback on DNS/connect failure only
+# phases = ["fetch"]                      # default; add "build" to tunnel for build scripts too
+
+[[network]]
+match = { host = "*.internal.example.com" }
+via = ["agent", "client"]
+```
+
+**Resolution**, for each destination:
+
+1. The best matching rule: rules from your user config first, then project
+   hints; within each, the most specific match (a port given, then more
+   literal characters) wins; ties go to the first.
+2. Without a rule, the sources are `["client", "agent"]` for destinations
+   in your `[tunnel]` (your machine first, then a direct connection if the
+   tunnel is refused, e.g. `allow_tunnel = false` or the build phase, or
+   fails to resolve or connect) and `["agent"]` (direct) for everything
+   else, so builds that do not use tunnels behave as before. For hosts that
+   must never be reached directly (split DNS, a public address that answers
+   403), add a rule with `via = ["client"]`.
+3. `client` needs the token's `allow_tunnel`, the destination in your
+   `[tunnel]` (checked by the agent and again by your machine for every
+   channel) and the current phase in the rule's `phases`. `agent` needs the
+   agent's `[network] direct`. `phases` restricts only `client`: build
+   scripts can open sockets from the agent anyway.
+
+**Project hints.** `.cargo/live.toml` may contain `[[network]]` with
+`match` and `via` only. They rank below your user rules and can never
+extend `[tunnel]` or set `phases`; a hint `via = ["client"]` for a host
+outside your `[tunnel]` just fails:
+
+```toml
+[[network]]
+match = { host = "gitlab.example.com" }
+via = ["client"]
+```
+
+**Phases.** The build step (build scripts, proc macros) gets no proxy
+unless one of your `[[network]]` rules has `"build"` in `phases`; then it
+gets the same variables, and each destination is checked against its rule
+again, so only destinations whose rule includes `build` may be tunneled.
+This mirrors the credential broker.
+
+Each destination tunneled in a build prints one line, and a destination
+without a route prints the chain:
+
+```
+cargo-live: tunneling gitlab.example.com:443 through this machine (fetch phase)
+cargo-live: no route to gitlab.example.com:443 (fetch phase): agent → denied by the agent's [network] direct; client → not in [tunnel] on the client
+```
+
+Credentials keep working through the proxy: forwarded credentials are
+resolved on your machine as before, and the tunnel carries git's and
+Cargo's TLS connection, `Authorization` header included, end to end.
+
+#### Agent policy
+
+```toml
+# agent.toml
+[network]
+direct = ["*.crates.io", "github.com", "codeload.github.com"]   # default ["*"]; [] for none
+
+[tokens.ci]
+allow_tunnel = false
+```
+
+- `[network] direct` lists the destinations (`host[:port]` globs, any port
+  when omitted) the proxy may connect to directly from the agent. Also
+  `--network-direct` / `CARGO_LIVE_AGENT_NETWORK_DIRECT` (comma-separated,
+  `""` for none). A denied direct connection falls through to the rule's
+  next source. Anything but the default `["*"]` makes every `cargo fetch`
+  run through the proxy, so that the policy applies.
+- `allow_tunnel = false` makes the agent never tunnel through the client
+  for builds of that token (e.g. CI tokens, whose "client" is not a
+  developer machine).
+- This is policy for traffic that goes **through the proxy**, not a
+  security boundary: build scripts and proc macros run on the agent and can
+  open connections themselves. Restrict the agent's egress at the network
+  level (Docker network, firewall, VPN access control) if that matters.
+
+#### Audit log
+
+Each proxied connection is appended to `<data_dir>/audit.log` when it ends
+(and logged on the agent's stderr): `kind` (`network`), `ts`, `token`,
+`workspace`, `host`, `port`, `phase`, `via` (`agent`, `client`, or `none`
+when nothing connected), `outcome` (`closed`, `idle-timeout`, `error`,
+`step-ended` for connections still open when the step ended, `aborted` for
+connections the step ended while they were still connecting, e.g. waiting
+for a tunnel slot or the client's answer, or `denied`, which includes
+connections from processes outside the build), `bytes_up`, `bytes_down`,
+and `chain`: the sources refused or failed before (for `denied`: why).
+Each connection gets exactly one entry. Payloads, headers and the proxy
+password never appear in it.
+
+#### `cargo live net explain`
+
+A dry run of the decision for a destination (port 443 unless given),
+from the workspace; nothing is connected:
+
+```sh
+cargo live net explain gitlab.example.com
+cargo live net explain crates.example.com:8443
+```
+
+```
+network access to gitlab.example.com:443 (agent build-host:2222)
+  rule                 user rule #1 (match host=gitlab.example.com): via = ["client"], phases = ["fetch"]
+  fetch phase: client  [would try] would tunnel through this machine ([tunnel] via "gitlab.example.com:443")
+  build phase: client  [not allowed] phase build not allowed (phases = ["fetch"], user rule #1 (match host=gitlab.example.com))
+  fetch step           cargo fetch runs with the proxy
+  build step           no proxy during the build (no [[network]] rule has "build" in phases)
+  this machine         in [tunnel] via "gitlab.example.com:443": connects with the system resolver when the agent asks
+```
+
+The rule line says where the rule came from (`user`, `project` or
+`default`).
+
+### B. Agent inside NetBird (setup key)
+
+[`compose.netbird.yaml`](compose.netbird.yaml) runs two services:
+
+- `netbird`: the official `netbirdio/netbird` image (pinned to 0.82.0 by
+  digest) with `NET_ADMIN`, `NET_RAW`, `BPF` and `/dev/net/tun` (kernel
+  WireGuard), `NB_MANAGEMENT_URL`, `NB_HOSTNAME`, `NB_SETUP_KEY_FILE`
+  pointing at a Docker secret, and a volume on `/var/lib/netbird` that keeps
+  the peer's identity across re-creation. It also publishes the agent's
+  port. NetBird's netstack (userspace) mode needs no `NET_ADMIN`, but it
+  configures neither routes nor DNS, so it does not work here.
+- `agent`: the agent image with `network_mode: service:netbird` (all of its
+  traffic and DNS go through NetBird) and `init: true`. It starts once
+  NetBird is connected and has taken over DNS (healthcheck), and is
+  restarted with it.
+
+**1. Create a setup key** in the NetBird dashboard (Setup Keys → Create
+Setup Key):
+
+- *Reusable*, with a usage limit of the number of agent containers you
+  expect (or a one-off key per agent).
+- *Ephemeral peers* for disposable or CI agents: such peers are removed
+  after 10 minutes offline. Leave it off for a long-lived agent whose state
+  volume keeps its peer.
+- A short expiry: the key is only needed to enroll; peers already enrolled
+  keep working when it expires or is revoked.
+- *Auto-assign groups*: a dedicated group, e.g. `cargo-live-agents`, which
+  the policies below refer to.
+
+**2. Limit access** with a policy (Access Control → Policies): source
+`cargo-live-agents`, destination the network resources (or peer group) of
+the hosts builds need, protocol TCP, ports 443 (and 22 for git over SSH, if
+used), plus UDP/TCP 53 to the internal DNS servers if they sit behind a
+routing peer. Make sure no broader policy (such as the default `All` ↔
+`All` policy) also applies to the group.
+
+**3. DNS** (the critical part): the nameserver that answers your internal
+domain (Networking → DNS → Nameservers, match domain `example.com`) must
+list `cargo-live-agents` in its distribution groups, and the group must not
+be in DNS Settings → Disable DNS management. Inside the container there is
+no systemd-resolved; NetBird then rewrites the container's
+`/etc/resolv.conf` in place (`# Generated by NetBird`, with NetBird's own
+resolver as the only nameserver; that resolver routes match domains to your
+nameservers and everything else to the container's original nameserver).
+A container with `network_mode: service:netbird` bind-mounts the very same
+`resolv.conf`, so the agent uses NetBird's resolver too; `dns:` cannot be
+set on such a container. Restart the pair through Compose (`docker compose
+... restart netbird` or `up`): if the netbird container is restarted behind
+Compose's back (`docker restart`, or the restart policy after a crash), the
+agent loses its network until it is restarted as well.
+
+**4. Secrets.** Put the setup key in a file that only you can read, never
+in the compose file, the image, the agent's environment or the repository:
+
+```sh
+(umask 077 && printf '%s\n' "$NB_SETUP_KEY" > netbird-setup-key)   # git- and docker-ignored
+# or point NETBIRD_SETUP_KEY_FILE at a file elsewhere
+```
+
+Compose mounts it at `/run/secrets/nb_setup_key` in the `netbird` container
+only (the agent never sees it). The bind mount keeps the file's owner and
+mode; NetBird runs as root, so a 0600 file owned by you works, except under
+rootless Docker or user namespace remapping, where it must be readable by
+the mapped root. Revoke the key in the dashboard when it is no longer
+needed.
+
+**5. Start and verify:**
+
+```sh
+export NB_MANAGEMENT_URL=https://netbird.example.com NB_HOSTNAME=cargo-live-ci-1
+docker compose -f compose.netbird.yaml up -d --build --wait
+docker compose -f compose.netbird.yaml exec netbird netbird status            # Management/Signal: Connected
+docker compose -f compose.netbird.yaml exec agent cat /etc/resolv.conf        # "# Generated by NetBird"
+docker compose -f compose.netbird.yaml exec agent getent hosts gitlab.example.com   # the internal address
+docker compose -f compose.netbird.yaml exec agent cargo-live-agent token create --name ci
+docker compose -f compose.netbird.yaml exec agent cargo-live-agent fingerprint
+```
+
+If an internal name resolves to its public address, NetBird is not serving
+the domain to this peer: check the nameserver's distribution groups and the
+`Nameservers` line of `netbird status`.
+
+On the clients of such an agent, prefer the agent for the VPN hosts and
+keep the tunnel as a fallback, or turn tunnels off for CI tokens with
+`allow_tunnel = false`:
+
+```toml
+[[network]]
+match = { host = "*.example.com" }
+via = ["agent", "client"]
+```
 
 ## Security model
 
@@ -630,7 +944,11 @@ The rule line says where the rule came from (`user`, `project` or
 - **Channel policy:** one `session` channel per connection, accepting only
   the `cargo-live` exec/subsystem request. Shells, PTYs, env, X11, signals,
   agent forwarding, TCP/IP and Unix-socket forwarding and other channel types
-  are refused.
+  are refused. In the other direction the agent opens `forwarded-tcpip`
+  channels for the build proxy's client tunnels; the client accepts them only
+  while one of its builds runs and only for destinations in its `[tunnel]`,
+  at most 32 at a time, and refuses every other channel type the agent might
+  open.
 - **Paths:** the agent validates every path from the client (no absolute
   paths, `..`, empty or NUL components), never follows symlinks while
   writing or deleting the mirror (symlinks are replicated as symlinks),
@@ -644,6 +962,19 @@ The rule line says where the rule came from (`user`, `project` or
   workspaces, the tokens file and the host key. Give tokens only to people
   who trust each other, and run one agent (container, with its own volume)
   per user or trust domain.
+- **Tunnels and the credential broker are only as isolated as the agent's
+  OS user.** While your build fetches, its proxy can reach whatever your
+  machine can reach (your VPN included, limited to your `[tunnel]`), and
+  its broker hands out your forwarded credentials. Both are per job and
+  password-protected, and the proxy additionally accepts only connections
+  from the job's own process tree (Cargo and its descendants, traced
+  through `/proc`), so another token's build cannot simply read the proxy
+  URL from `/proc/<pid>/environ` and connect. That does not make
+  concurrent builds of the same OS user safe from each other: such a
+  process can still ptrace the job's processes, read their memory and
+  `/proc` entries, or act through them. **When tunnels to private networks
+  are used on a shared machine, run a dedicated agent (container) per
+  user.**
 - Do not sync secrets: everything in the workspace except excluded paths is
   copied to the build host. For credentials builds need, see
   [Credentials](#credentials).
@@ -665,8 +996,8 @@ versions of both.
 
 This is an early prototype, not a complete replacement for Cargo:
 
-- Supported commands: `run` and `check` (plus `login`/`logout` and
-  `creds explain`). `build`,
+- Supported commands: `run` and `check` (plus `login`/`logout`,
+  `creds explain` and `net explain`). `build`,
   `test`, `bench` and others are not forwarded.
 - `--target-dir` and `--manifest-path` are refused. For `run`,
   `--message-format` is refused, and cross-compilation (`--target`,
@@ -684,6 +1015,14 @@ This is an early prototype, not a complete replacement for Cargo:
 - Workspaces are identified by token and local path: two machines using the
   same token and the same workspace path share one remote workspace (and its
   lock).
+- When the build proxy runs (see [A. Tunnel through the
+  client](#a-tunnel-through-the-client)), its direct connections do not
+  chain to an upstream proxy: `HTTPS_PROXY` in the agent's own environment
+  is replaced for that step. An agent that needs a corporate proxy for
+  egress can still build without network config (its proxy settings are
+  left alone then), but cannot combine it with tunnels, `[[network]]` rules
+  or a restricted `[network] direct`. Plain-HTTP requests through the proxy
+  are one request per connection, with a `Content-Length` body only.
 - Path dependencies outside the workspace are not synced. Interactive builds
   are not supported (Cargo's stdin is closed). Credentials for private
   dependencies are brokered per job, see [Credentials](#credentials).

@@ -8,14 +8,15 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use russh::client::{self, Handle};
+use russh::client::{self, ChannelOpenHandle, Handle};
 use russh::keys::{Algorithm, PublicKeyOrCertificate};
-use russh::{ChannelMsg, ChannelStream, Preferred};
+use russh::{Channel, ChannelMsg, ChannelOpenFailure, ChannelStream, Preferred};
 use tokio::net::TcpStream;
 
 use cargo_live_proto::{fingerprint, CHANNEL_NAME, USERNAME};
 
 use crate::config::AgentUrl;
+use crate::net::TunnelGate;
 use crate::store::{HostKeyStatus, KnownHosts};
 use crate::{error, Result};
 
@@ -61,6 +62,8 @@ pub fn verify_host(
 }
 
 pub struct Verifier {
+    /// Decides on the agent's tunnel channels; `None` refuses them all.
+    tunnel: Option<Arc<TunnelGate>>,
     pin: Option<String>,
     known_hosts: KnownHosts,
     host: String,
@@ -94,6 +97,105 @@ impl client::Handler for Verifier {
         *self.result.lock().unwrap() = Some((fp, verdict));
         Ok(accept)
     }
+
+    /// The build proxy's `client` tunnels; checked against `[tunnel]`.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        crate::net::handle_channel(
+            self.tunnel.as_ref(),
+            channel,
+            connected_address,
+            connected_port,
+            reply,
+        )
+        .await;
+        Ok(())
+    }
+
+    // Every other channel the agent might open is refused (russh's
+    // defaults accept them).
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply, "forwarded-streamlocal").await;
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply, "agent forwarding").await;
+        Ok(())
+    }
+
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply, "session").await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply, "direct-tcpip").await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply, "direct-streamlocal").await;
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply, "x11").await;
+        Ok(())
+    }
+}
+
+async fn refuse(reply: ChannelOpenHandle, kind: &str) {
+    eprintln!("cargo-live: refused a {kind} channel opened by the agent");
+    reply
+        .reject(ChannelOpenFailure::AdministrativelyProhibited)
+        .await;
 }
 
 pub struct Connection {
@@ -117,8 +219,13 @@ fn client_config() -> client::Config {
 }
 
 /// Connects, verifies the host key, authenticates with `token` and opens the
-/// `cargo-live` channel.
-pub async fn connect(url: &AgentUrl, pin: Option<&str>, token: &str) -> Result<Connection> {
+/// `cargo-live` channel. `tunnel` decides on the agent's tunnel channels.
+pub async fn connect(
+    url: &AgentUrl,
+    pin: Option<&str>,
+    token: &str,
+    tunnel: Option<Arc<TunnelGate>>,
+) -> Result<Connection> {
     let host = url.to_string();
     let known_hosts = KnownHosts::default_location()?;
     let known_hosts_path = known_hosts.path.clone();
@@ -152,6 +259,7 @@ pub async fn connect(url: &AgentUrl, pin: Option<&str>, token: &str) -> Result<C
 
     let result = Arc::new(Mutex::new(None));
     let verifier = Verifier {
+        tunnel,
         pin: pin.map(str::to_owned),
         known_hosts,
         host: host.clone(),

@@ -1,6 +1,7 @@
 //! Shared harness for the end-to-end tests.
 #![allow(dead_code)]
 
+pub mod fixture;
 pub mod httpd;
 
 use std::env;
@@ -62,6 +63,8 @@ pub struct AgentOptions {
     pub env: Vec<(String, String)>,
     /// Use a fresh `CARGO_HOME` for builds (no cached git/registry data).
     pub isolated_cargo_home: bool,
+    /// The Cargo the agent runs (default: the one running the tests).
+    pub cargo: Option<PathBuf>,
 }
 
 impl Agent {
@@ -87,7 +90,7 @@ impl Agent {
             .args(["serve", "--listen", "127.0.0.1:0", "--data-dir"])
             .arg(data.path())
             .arg("--cargo")
-            .arg(cargo())
+            .arg(options.cargo.clone().unwrap_or_else(cargo))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log).unwrap());

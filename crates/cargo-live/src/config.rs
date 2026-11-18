@@ -7,6 +7,7 @@ use serde::Deserialize;
 use cargo_live_proto::{ExcludeSet, DEFAULT_PORT};
 
 use crate::creds::ProjectRule;
+use crate::net::ProjectNetRule;
 use crate::{error, Result};
 
 #[derive(Debug, Deserialize)]
@@ -18,6 +19,9 @@ pub struct Config {
     /// Credential source hints (`[[credentials]]` with match + sources).
     #[serde(default)]
     pub credentials: Vec<ProjectRule>,
+    /// Network route hints (`[[network]]` with match + via).
+    #[serde(default)]
+    pub network: Vec<ProjectNetRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +155,9 @@ impl Config {
         for hint in &self.credentials {
             hint.validate()?;
         }
+        for hint in &self.network {
+            hint.validate()?;
+        }
         Ok(())
     }
 }
@@ -198,6 +205,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hints.credentials.len(), 1);
+        let net = Config::parse(
+            "[remote]\nurl = 'a'\n[[network]]\nmatch = { host = 'gitlab.volka.com', port = 443 }\nvia = ['client']\n",
+        )
+        .unwrap();
+        assert_eq!(net.network.len(), 1);
         for text in [
             "[remote]\nhost = 'old'\nbase_dir = '/x'\n",
             "[remote]\nurl = 'a;b'\n",
@@ -209,6 +221,10 @@ mod tests {
             "[remote]\nurl = 'a'\n[[credentials]]\nmatch = { kind = 'git' }\nsources = ['client']\nphases = ['build']\n",
             "[remote]\nurl = 'a'\n[forward]\ngit = ['*']\n",
             "[remote]\nurl = 'a'\n[[credentials]]\nmatch = { kind = 'git' }\nsources = []\n",
+            // Network hints cannot set phases or extend [tunnel].
+            "[remote]\nurl = 'a'\n[[network]]\nmatch = { host = 'h' }\nvia = ['client']\nphases = ['build']\n",
+            "[remote]\nurl = 'a'\n[tunnel]\nhosts = ['*']\n",
+            "[remote]\nurl = 'a'\n[[network]]\nmatch = { host = 'h' }\nvia = []\n",
         ] {
             assert!(Config::parse(text).is_err(), "{text}");
         }

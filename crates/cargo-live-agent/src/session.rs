@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use russh::server::Msg;
+use russh::server::{Handle, Msg};
 use russh::ChannelStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -19,6 +19,7 @@ use cargo_live_proto::{
 
 use crate::cred::CredSession;
 use crate::mirror;
+use crate::net::NetSession;
 use crate::server::Shared;
 use crate::{job, log, Result};
 
@@ -40,15 +41,29 @@ pub struct Context {
     pub workspace: Option<Workspace>,
     pub run_target: Option<String>,
     pub creds: Arc<CredSession>,
+    pub net: Arc<NetSession>,
 }
 
-pub async fn run(shared: Arc<Shared>, token: String, peer: SocketAddr, stream: ChannelStream<Msg>) {
+pub async fn run(
+    shared: Arc<Shared>,
+    token: String,
+    peer: SocketAddr,
+    stream: ChannelStream<Msg>,
+    handle: Handle,
+) {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut rd = FrameReader::new(rd);
     let creds = Arc::new(CredSession::new(
         token.clone(),
         shared.settings.creds.clone(),
         shared.settings.paths.data_dir.join("audit.log"),
+    ));
+    let net = Arc::new(NetSession::new(
+        token.clone(),
+        shared.settings.network_direct.clone(),
+        shared.settings.creds.token_policy(&token).allow_tunnel,
+        shared.settings.paths.data_dir.join("audit.log"),
+        Some(handle),
     ));
     let mut ctx = Context {
         shared,
@@ -57,6 +72,7 @@ pub async fn run(shared: Arc<Shared>, token: String, peer: SocketAddr, stream: C
         workspace: None,
         run_target: None,
         creds,
+        net,
     };
     if let Err(e) = ctx.serve(&mut rd, &mut wr).await {
         log!("{peer} [{}]: {e}", ctx.token);
@@ -113,6 +129,7 @@ impl Context {
                     }
                     let ws = self.open(&workspace_id, rd, wr).await?;
                     self.creds.set_workspace(&workspace_id);
+                    self.net.set_workspace(&workspace_id);
                     write_frame(
                         wr,
                         &AgentMsg::Opened {
@@ -138,7 +155,8 @@ impl Context {
                         request.relative_cwd
                     );
                     let outcome =
-                        job::build(&self.shared, ws, &request, &self.creds, rd, wr).await?;
+                        job::build(&self.shared, ws, &request, &self.creds, &self.net, rd, wr)
+                            .await?;
                     log!(
                         "{} [{}]: cargo exited with {}",
                         self.peer,
@@ -174,6 +192,24 @@ impl Context {
                 }
                 ClientMsg::Explain { scope } => {
                     let steps = self.creds.explain(&scope);
+                    write_frame(wr, &AgentMsg::ExplainResult { steps }).await?;
+                }
+                ClientMsg::NetworkPolicy(policy) => {
+                    // Parsed once here; invalid entries end the session.
+                    let policy = policy
+                        .compile()
+                        .map_err(|e| format!("invalid network policy: {e}"))?;
+                    log!(
+                        "{} [{}]: network policy: {} rules, {} [tunnel] hosts",
+                        self.peer,
+                        self.token,
+                        policy.rule_count(),
+                        policy.tunnel_count()
+                    );
+                    self.net.set_policy(policy);
+                }
+                ClientMsg::NetExplain { destination } => {
+                    let steps = self.net.explain(&destination);
                     write_frame(wr, &AgentMsg::ExplainResult { steps }).await?;
                 }
                 other => return Err(format!("unexpected message {}", msg_name(&other)).into()),
@@ -451,6 +487,8 @@ fn msg_name(msg: &ClientMsg) -> &'static str {
         ClientMsg::CredentialPolicy(_) => "CredentialPolicy",
         ClientMsg::CredentialResponse { .. } => "CredentialResponse",
         ClientMsg::Explain { .. } => "Explain",
+        ClientMsg::NetworkPolicy(_) => "NetworkPolicy",
+        ClientMsg::NetExplain { .. } => "NetExplain",
     }
 }
 

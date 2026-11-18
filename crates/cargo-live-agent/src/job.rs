@@ -17,9 +17,12 @@ use cargo_live_proto::{
     FrameReader, WaitReason,
 };
 
-use crate::cred::broker::{BROKER_ENV, NONCE_ENV};
+use crate::cred::broker::{git_config_env, git_credential_entries, BROKER_ENV, NONCE_ENV};
 use crate::cred::{Broker, CredSession, ToClient};
 use crate::log;
+use crate::net::peer::JobRoot;
+use crate::net::proxy::Proxy;
+use crate::net::NetSession;
 use crate::runner::{RunnerOutput, OUT_ENV};
 use crate::server::Shared;
 use crate::session::Workspace;
@@ -199,6 +202,7 @@ pub async fn build<R, W>(
     ws: &Workspace,
     request: &BuildRequest,
     creds: &Arc<CredSession>,
+    net: &Arc<NetSession>,
     rd: &mut FrameReader<R>,
     wr: &mut W,
 ) -> Result<Outcome>
@@ -245,26 +249,42 @@ where
         }
     };
 
-    // Step 1: `cargo fetch` with the broker open. No third-party code runs
-    // in this step.
+    net.begin_build();
+    let exe = shared
+        .agent_exe
+        .to_str()
+        .ok_or("agent executable path is not UTF-8")?;
+
+    // Step 1: `cargo fetch` with the broker open, and the proxy if the
+    // session needs it (otherwise the agent's own proxy settings apply).
+    // No third-party code runs in this step.
     let mut fetch = fetch_command(shared, ws, request, &cwd, &registries);
     let (client_tx, client_rx) = mpsc::channel(16);
+    let job = JobRoot::default();
     let broker = Broker::start(
         &ws.tmp,
         Phase::Fetch,
         creds.clone(),
-        client_tx,
+        client_tx.clone(),
         &shared.agent_exe,
     )?;
-    let extra = broker.configure(
-        &mut fetch,
-        &shared.agent_exe,
-        &creds.git_hosts(),
-        &registry_names,
-    )?;
+    let extra = broker.configure(&mut fetch, &shared.agent_exe, &registry_names)?;
     fetch.args(extra);
-    let code = run_step(shared, fetch, client_rx, rd, wr).await;
-    drop(broker);
+    let mut git = git_credential_entries(exe, &creds.git_hosts());
+    let proxy = if net.proxy_needed() {
+        let proxy = Proxy::start(Phase::Fetch, net.clone(), client_tx, job.clone())?;
+        proxy.configure(&mut fetch);
+        git.extend(proxy.git_entries());
+        Some(proxy)
+    } else {
+        drop(client_tx);
+        None
+    };
+    if !git.is_empty() {
+        apply_git_config(&mut fetch, &git);
+    }
+    let code = run_step(shared, fetch, client_rx, &job, rd, wr).await;
+    drop((broker, proxy));
     let code = code?;
     if code != 0 {
         let message = format!(
@@ -278,32 +298,42 @@ where
     }
 
     // Step 2: the build, which runs build scripts and proc macros. The
-    // broker is only open if some scope opted into the build phase; each
-    // request is still checked against that scope's phases.
+    // broker (proxy) is only open if some credential (network) rule opted
+    // into the build phase; each request is still checked against that
+    // rule's phases.
     let mut cmd = cargo_command(shared, ws, request, &host_triple, &cwd, &registries)?;
     let (client_tx, client_rx) = mpsc::channel(16);
+    let job = JobRoot::default();
+    let mut git = Vec::new();
     let broker = if creds.build_phase_enabled() {
         let broker = Broker::start(
             &ws.tmp,
             Phase::Build,
             creds.clone(),
-            client_tx,
+            client_tx.clone(),
             &shared.agent_exe,
         )?;
-        let extra = broker.configure(
-            &mut cmd,
-            &shared.agent_exe,
-            &creds.git_hosts(),
-            &registry_names,
-        )?;
+        let extra = broker.configure(&mut cmd, &shared.agent_exe, &registry_names)?;
         cmd.args(extra);
+        git.extend(git_credential_entries(exe, &creds.git_hosts()));
         Some(broker)
+    } else {
+        None
+    };
+    let proxy = if net.build_phase_enabled() {
+        let proxy = Proxy::start(Phase::Build, net.clone(), client_tx, job.clone())?;
+        proxy.configure(&mut cmd);
+        git.extend(proxy.git_entries());
+        Some(proxy)
     } else {
         drop(client_tx);
         None
     };
-    let code = run_step(shared, cmd, client_rx, rd, wr).await;
-    drop(broker);
+    if !git.is_empty() {
+        apply_git_config(&mut cmd, &git);
+    }
+    let code = run_step(shared, cmd, client_rx, &job, rd, wr).await;
+    drop((broker, proxy));
     let code = code?;
     let run_target = if request.command == BuildCommand::Run && code == 0 {
         Some(read_runner_output(&ws.runner_out)?)
@@ -313,12 +343,21 @@ where
     Ok(Outcome { code, run_target })
 }
 
+/// Adds git configuration entries after the agent's own `GIT_CONFIG_*`.
+fn apply_git_config(cmd: &mut Command, entries: &[(String, String)]) {
+    for (k, v) in git_config_env(entries, std::env::var("GIT_CONFIG_COUNT").ok()) {
+        cmd.env(k, v);
+    }
+}
+
 /// Runs one Cargo step, streaming its output and relaying credential
-/// requests to the client. Returns Cargo's exit code.
+/// requests to the client. Cargo's pid goes into `job` (the proxy accepts
+/// connections from its process tree only). Returns Cargo's exit code.
 async fn run_step<R, W>(
     shared: &Shared,
     mut cmd: Command,
     mut client_rx: mpsc::Receiver<ToClient>,
+    job: &JobRoot,
     rd: &mut FrameReader<R>,
     wr: &mut W,
 ) -> Result<i32>
@@ -329,6 +368,9 @@ where
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", shared.settings.cargo.display()))?;
+    if let Some(pid) = child.id() {
+        let _ = job.set(pid);
+    }
     let pgid = child.id().map(|id| id as i32);
     let (tx, mut rx) = mpsc::channel::<AgentMsg>(64);
     let stdout = child.stdout.take().expect("piped");
@@ -386,6 +428,7 @@ where
                     ToClient::Event(event) => {
                         write_frame(wr, &AgentMsg::CredentialEvent(event)).await?
                     }
+                    ToClient::Net(event) => write_frame(wr, &AgentMsg::NetEvent(event)).await?,
                 },
                 frame = rd.next::<ClientMsg>() => match frame {
                     Ok(Some(ClientMsg::CredentialResponse { id, result })) => {

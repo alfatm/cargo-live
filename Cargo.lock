@@ -308,6 +308,7 @@ dependencies = [
  "cargo-live-proto",
  "clap",
  "getrandom 0.4.3",
+ "httparse",
  "libc",
  "postcard",
  "russh",
