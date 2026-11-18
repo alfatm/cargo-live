@@ -1,0 +1,11 @@
+**/target/
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+compose.yaml
+.vscode/
+.idea/
+.claude/
+**/*.log
+**/*.swp

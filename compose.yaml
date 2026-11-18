@@ -1,0 +1,35 @@
+# Example deployment of cargo-live-agent.
+#
+#   docker compose up -d --build
+#   docker compose exec agent cargo-live-agent token create --name alice
+#   docker compose exec agent cargo-live-agent fingerprint
+services:
+  agent:
+    build: .
+    image: cargo-live-agent
+    # Reaps orphaned build processes (the agent is otherwise PID 1).
+    init: true
+    restart: unless-stopped
+    ports:
+      - "2222:2222"
+    environment:
+      CARGO_LIVE_AGENT_MAX_CONCURRENT_BUILDS: "2"
+      # CARGO_LIVE_AGENT_MAX_CONNECTIONS: "64"
+      # CARGO_LIVE_AGENT_LOCK_TIMEOUT: "600"
+    volumes:
+      # Host key, tokens, source mirrors and target directories.
+      - data:/data
+      # Cargo's download caches, shared by all builds.
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      # Toolchains installed for rust-toolchain.toml files. The volume is
+      # seeded from the image once and then shadows the image's toolchain, so
+      # it keeps the old default toolchain after an image upgrade until it is
+      # removed.
+      # - rustup:/usr/local/rustup
+
+volumes:
+  data:
+  cargo-registry:
+  cargo-git:
+  # rustup:
